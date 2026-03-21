@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Chrome profile (session data)
+chrome_profile/
+
+# Auth/secrets
+claude_auth.json
+
+# Windows
+*.lnk
+Thumbs.db
+desktop.ini
+
+# State files
+window_state.json
+
+# Claude Code local settings
+.claude/

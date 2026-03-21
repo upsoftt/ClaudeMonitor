@@ -1,0 +1,23 @@
+{
+  "name": "ClaudeMonitor",
+  "icon": null,
+  "ownTrayIcon": true,
+  "autostart": true,
+  "openFolder": true,
+  "components": [
+    {
+      "name": null,
+      "lifecycle": {
+        "start": "D:/MyProjects/ClaudeMonitor/.venv/Scripts/pythonw.exe usage_monitor.py",
+        "stop": null,
+        "build": null
+      },
+      "pipe": "trayconsole_claude_monitor",
+      "window": true,
+      "customActions": [
+        {"label": "Обновить данные", "command": "refresh"},
+        {"label": "Войти снова", "command": "relogin"}
+      ]
+    }
+  ]
+}

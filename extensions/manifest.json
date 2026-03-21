@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Monitor",
+  "version": "1.0",
+  "description": "Передаёт сессию Claude.ai в приложение Claude Monitor",
+  "permissions": ["cookies"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://localhost/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Claude Monitor"
+  }
+}
