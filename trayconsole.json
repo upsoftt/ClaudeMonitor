@@ -8,7 +8,7 @@
     {
       "name": null,
       "lifecycle": {
-        "start": "D:/MyProjects/ClaudeMonitor/.venv/Scripts/pythonw.exe usage_monitor.py",
+        "start": ".venv/Scripts/pythonw.exe usage_monitor.py",
         "stop": null,
         "build": null
       },
