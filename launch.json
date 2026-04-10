@@ -1,0 +1,6 @@
+{
+  "type": "command",
+  "command": "python usage_monitor.py",
+  "cwd": ".",
+  "description": "ClaudeMonitor — мониторинг использования Claude AI (PyQt5 GUI)"
+}

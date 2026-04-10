@@ -112,6 +112,9 @@ class TrayConsoleClient:
         """Остановить клиент и закрыть соединение."""
         self._running = False
         self._close_handle()
+        # Ждём завершения heartbeat-потока (макс 2 сек), чтобы он не перезаписал файл после удаления
+        if hasattr(self, '_heartbeat_thread') and self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2)
         self._delete_heartbeat()
         self._release_mutex()
 
@@ -127,33 +130,28 @@ class TrayConsoleClient:
 
     def _listen(self):
         """Основной цикл: подключение → чтение → переподключение."""
-        retry_count = 0
-        max_retries = 3
+        retry_delay = 2
+        MAX_RETRY_DELAY = 30
 
         while self._running:
             try:
                 self._connect()
-                retry_count = 0
+                retry_delay = 2  # сброс при успешном подключении
                 self._read_loop()
             except pywintypes.error as e:
                 if not self._running:
                     break
                 self._close_handle()
-                retry_count += 1
-
-                if retry_count <= max_retries:
-                    _log(f"Ошибка подключения (попытка {retry_count}/{max_retries}): {e}")
-                    time.sleep(2)
-                else:
-                    _log("Превышено количество попыток, ожидание 10 сек...")
-                    time.sleep(10)
-                    retry_count = 0
+                _log(f"Ошибка подключения (retry через {retry_delay} сек): {e}")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
             except Exception as e:
                 if not self._running:
                     break
                 _log(f"Непредвиденная ошибка: {e}")
                 self._close_handle()
-                time.sleep(2)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
 
     def _connect(self):
         """Подключиться к Named Pipe серверу."""
@@ -218,9 +216,11 @@ class TrayConsoleClient:
 
     def _dispatch(self, command: str) -> dict:
         """Найти и вызвать обработчик команды."""
+        handlers = self._handlers  # атомарное чтение ссылки (GIL)
+
         # Shutdown — особый случай, всегда проверяем первым
         if command == "shutdown":
-            handler = self._handlers.get("shutdown", self._default_handlers["shutdown"])
+            handler = handlers.get("shutdown", self._default_handlers["shutdown"])
             result = handler()
             result = result if isinstance(result, dict) else {"status": "ok"}
 
@@ -233,15 +233,15 @@ class TrayConsoleClient:
 
         # Обработка custom:* команд
         if command.startswith("custom:"):
-            if command in self._handlers:
-                result = self._handlers[command]()
+            if command in handlers:
+                result = handlers[command]()
                 return result if isinstance(result, dict) else {"status": "ok"}
             else:
                 return {"error": f"unknown custom command: {command}"}
 
         # Пользовательские обработчики
-        if command in self._handlers:
-            result = self._handlers[command]()
+        if command in handlers:
+            result = handlers[command]()
             return result if isinstance(result, dict) else {"status": "ok"}
 
         # Встроенные обработчики
@@ -270,7 +270,8 @@ class TrayConsoleClient:
         """Цикл записи heartbeat каждые _HEARTBEAT_INTERVAL секунд."""
         while self._running:
             try:
-                self._write_heartbeat()
+                if self._running:
+                    self._write_heartbeat()
             except Exception as e:
                 _log(f"Ошибка записи heartbeat: {e}")
 
@@ -303,11 +304,17 @@ class TrayConsoleClient:
     def _create_mutex(self):
         """Создать Named Mutex как маркер работающего процесса."""
         try:
+            # Корректные типы для 64-bit Windows: handle — pointer, не int32
+            ctypes.windll.kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+            ctypes.windll.kernel32.CreateMutexW.argtypes = [
+                ctypes.wintypes.LPVOID, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR
+            ]
             mutex_name = rf"Global\TrayConsole_{self._pipe_name}"
+            INVALID_HANDLE = ctypes.wintypes.HANDLE(-1).value
             handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
-            if handle == 0:
-                error = ctypes.GetLastError()
-                _log(f"Не удалось создать mutex: GetLastError={error}")
+            last_error = ctypes.GetLastError()
+            if handle in (0, None, INVALID_HANDLE):
+                _log(f"Не удалось создать mutex: GetLastError={last_error}")
             else:
                 self._mutex_handle = handle
                 _log(f"Mutex создан: {mutex_name}")
@@ -318,6 +325,7 @@ class TrayConsoleClient:
         """Освободить Named Mutex."""
         if self._mutex_handle is not None:
             try:
+                ctypes.windll.kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
                 ctypes.windll.kernel32.CloseHandle(self._mutex_handle)
                 _log("Mutex освобождён")
             except Exception as e:

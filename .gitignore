@@ -17,6 +17,8 @@ chrome_profile/
 
 # Auth/secrets
 claude_auth.json
+accounts/
+accounts_meta.json
 
 # Windows
 *.lnk
