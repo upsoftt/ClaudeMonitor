@@ -1843,6 +1843,43 @@ class UsageWindow(QWidget):
         # Refresh in background — error won't clear the screen
         self._fetch(silent=True)
 
+    # ---- Auto-switch when active account is exhausted ------------
+
+    def _auto_switch_if_exhausted(self):
+        """If the active account hit session/weekly 100%, switch to the topmost
+        usable account (group 1 in _account_sort_key). No-op if there is no
+        better candidate, or if the candidate has no fetched data yet."""
+        active_id = self._account_manager.get_active_id()
+        if not active_id:
+            return
+        models = self._accounts_data.get(active_id, [])
+        if not models:
+            return
+        session_m = next((m for m in models if m["name"] == "Сессия"), None)
+        weekly_m  = next((m for m in models if m["name"] == "Все модели"), None)
+        session_pct = session_m["pct"] if session_m else 0
+        weekly_pct  = weekly_m["pct"]  if weekly_m  else 0
+        # Only act when the active account is no longer usable
+        if session_pct < 100 and weekly_pct < 100:
+            return
+
+        accounts = self._account_manager.get_all()
+        if len(accounts) < 2:
+            return
+
+        sorted_accs = sorted(accounts, key=self._account_sort_key)
+        best = sorted_accs[0]
+        best_id = best["id"]
+        if best_id == active_id:
+            return  # nothing better available
+        # Only switch if the candidate is genuinely usable (group 1)
+        if self._account_sort_key(best)[0] != 1:
+            return
+        # Skip candidates we have no data for yet — avoid blind switching
+        if best_id not in self._accounts_data:
+            return
+        self._switch_account(best_id)
+
     # ---- Fetch active account ------------------------------------
 
     def _fetch(self, silent: bool = False):
@@ -1898,6 +1935,7 @@ class UsageWindow(QWidget):
         self._accounts_errors.pop(account_id, None)
         self._schedule_rebuild_accounts()
         self._check_autopin_candidates()
+        self._auto_switch_if_exhausted()
 
     def _on_bg_error(self, account_id: str, msg: str):
         self._fetching_ids.discard(account_id)
@@ -2007,12 +2045,14 @@ class UsageWindow(QWidget):
             self._accounts_data[account_id] = models
             self._schedule_rebuild_accounts()
             self._check_autopin_candidates()
+            self._auto_switch_if_exhausted()
             return
         if active_id:
             self._accounts_data[active_id] = models
         self._rebuild(models)
         self._schedule_rebuild_accounts()
         self._check_autopin_candidates()
+        self._auto_switch_if_exhausted()
         self._status_lbl.setText("")
 
     def _on_error(self, msg: str, silent: bool = False, account_id: str = ""):
@@ -2074,6 +2114,25 @@ class UsageWindow(QWidget):
 
     # ---- Rebuild accounts table ----------------------------------
 
+    def _account_sort_key(self, acc):
+        """Ranking key for accounts. Group 1 = usable, 2 = session full, 3 = weekly full.
+        Inside a group: soonest 5h reset first; tiebreak: higher session usage first."""
+        aid = acc["id"]
+        models = self._accounts_data.get(aid, [])
+        session_m = next((m for m in models if m["name"] == "Сессия"), None)
+        weekly_m  = next((m for m in models if m["name"] == "Все модели"), None)
+        weekly_pct  = weekly_m["pct"]  if weekly_m  else 0
+        session_pct = session_m["pct"] if session_m else 0
+        if session_m and session_m.get("reset_dt"):
+            secs = max(0, int((session_m["reset_dt"] - datetime.now()).total_seconds()))
+        else:
+            secs = 99999
+        if weekly_pct >= 100:
+            return (3, 99999, 0)
+        if session_pct >= 100:
+            return (2, secs, 0)
+        return (1, secs, -session_pct)
+
     def _do_rebuild_accounts(self):
         while self._acc_rows_layout.count():
             w = self._acc_rows_layout.takeAt(0).widget()
@@ -2087,28 +2146,7 @@ class UsageWindow(QWidget):
             self.adjustSize()
             return
 
-        def _sort_key(acc):
-            aid = acc["id"]
-            models = self._accounts_data.get(aid, [])
-            session_m = next((m for m in models if m["name"] == "Сессия"), None)
-            weekly_m  = next((m for m in models if m["name"] == "Все модели"), None)
-            weekly_pct  = weekly_m["pct"]  if weekly_m  else 0
-            session_pct = session_m["pct"] if session_m else 0
-            if session_m and session_m.get("reset_dt"):
-                secs = max(0, int((session_m["reset_dt"] - datetime.now()).total_seconds()))
-            else:
-                secs = 99999
-            # Group 3: weekly exhausted — unusable until weekly resets
-            if weekly_pct >= 100:
-                return (3, 99999, 0)
-            # Group 2: session full — can't send messages right now, wait for reset
-            if session_pct >= 100:
-                return (2, secs, 0)
-            # Group 1: usable — soonest 5h reset first; tiebreak: higher usage first
-            # (already used more = more urgent to keep spending before the window closes)
-            return (1, secs, -session_pct)
-
-        accounts = sorted(accounts, key=_sort_key)
+        accounts = sorted(accounts, key=self._account_sort_key)
 
         for acc in accounts:
             aid = acc["id"]

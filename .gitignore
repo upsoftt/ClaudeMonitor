@@ -30,3 +30,7 @@ window_state.json
 
 # Claude Code local settings
 .claude/
+
+# MemPalace
+mempalace.yaml
+entities.json
