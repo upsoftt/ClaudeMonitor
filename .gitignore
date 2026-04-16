@@ -34,3 +34,9 @@ window_state.json
 # MemPalace
 mempalace.yaml
 entities.json
+
+# Ralph runtime artifacts
+.ralph-runner/
+execution_history.md
+ralph_history.txt
+specs/
