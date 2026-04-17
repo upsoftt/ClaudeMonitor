@@ -28,6 +28,9 @@ desktop.ini
 # State files
 window_state.json
 
+# Proxy config
+proxy.json
+
 # Claude Code local settings
 .claude/
 

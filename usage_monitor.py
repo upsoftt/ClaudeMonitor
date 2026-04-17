@@ -24,7 +24,7 @@ except ImportError:
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-    QSystemTrayIcon, QMenu, QAction, QPushButton,
+    QSystemTrayIcon, QMenu, QAction, QPushButton, QInputDialog, QLineEdit,
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QFileSystemWatcher
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QCursor
@@ -39,11 +39,126 @@ AUTH_FILE         = _APP_DIR / "claude_auth.json"
 _STATE_FILE       = _APP_DIR / "window_state.json"
 ACCOUNTS_DIR      = _APP_DIR / "accounts"
 ACCOUNTS_META     = _APP_DIR / "accounts_meta.json"
+PROXY_FILE        = _APP_DIR / "proxy.json"
 COOKIE_BRIDGE_PORT = 19224
 CLAUDE_CODE_CREDS = Path.home() / ".claude" / ".credentials.json"
 
-_VENV_PY = _APP_DIR / ".venv" / "Scripts" / "python.exe"
-_SUBPROCESS_PY = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
+def _find_venv_python() -> str:
+    """Find a real python.exe for subprocesses.
+
+    In frozen mode sys.executable points to ClaudeMonitor.exe, which cannot
+    run ad-hoc -c scripts (it re-enters the GUI, spawning duplicates).
+    Search .venv in app dir, in parent (project root), and in %LOCALAPPDATA%.
+    """
+    candidates = [
+        _APP_DIR / ".venv" / "Scripts" / "python.exe",
+        _APP_DIR.parent / ".venv" / "Scripts" / "python.exe",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    # Frozen + no venv found → refuse to spawn subprocesses.
+    return ""
+
+
+_SUBPROCESS_PY = _find_venv_python()
+
+
+def _load_proxy_url() -> str:
+    """Return configured proxy URL from proxy.json or env, or empty."""
+    try:
+        if PROXY_FILE.exists():
+            data = json.loads(PROXY_FILE.read_text(encoding="utf-8"))
+            url = (data.get("url") or "").strip()
+            if url:
+                return url
+    except Exception:
+        pass
+    return (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
+
+
+def _save_proxy_url(url: str) -> None:
+    """Persist proxy URL (empty string clears it)."""
+    try:
+        PROXY_FILE.write_text(
+            json.dumps({"url": url.strip()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    _PROXY_DECISION["checked_at"] = 0.0  # invalidate cache
+
+
+_PROXY_DECISION = {"url": "", "checked_at": 0.0}
+_PROXY_RECHECK_SEC = 600  # re-probe direct access every 10 min
+
+
+def _probe_direct_ok() -> bool:
+    """True if claude.ai API reachable directly within 5s.
+
+    Probes the real API endpoint (/api/organizations), not the CDN-cached root,
+    so that region blocks and backend timeouts are correctly detected as "use proxy".
+    Any HTTP response (incl. 401 Unauthorized) = server reachable.
+    Timeout/connection error = blocked or unreachable → need proxy.
+    """
+    import urllib.request, urllib.error
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(
+            "https://claude.ai/api/organizations",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with opener.open(req, timeout=5) as resp:
+            return 200 <= resp.status < 500  # any real server response
+    except urllib.error.HTTPError as e:
+        # 401/403/451 means server responded — direct access works at the network level.
+        # For region blocks (451) treat as needing proxy.
+        return e.code != 451 and e.code < 500
+    except Exception:
+        return False
+
+
+def _invalidate_proxy_cache() -> None:
+    """Force re-probe on next _effective_proxy_url() call."""
+    _PROXY_DECISION["checked_at"] = 0.0
+
+
+def _effective_proxy_url() -> str:
+    """Return proxy URL to use now: empty if direct works, configured proxy otherwise.
+
+    Caches the decision for _PROXY_RECHECK_SEC to avoid probing on every request.
+    """
+    import time
+    configured = _load_proxy_url()
+    if not configured:
+        return ""  # no proxy configured → direct only
+    now = time.monotonic()
+    if now - _PROXY_DECISION["checked_at"] < _PROXY_RECHECK_SEC:
+        return _PROXY_DECISION["url"]
+    if _probe_direct_ok():
+        _PROXY_DECISION["url"] = ""
+    else:
+        _PROXY_DECISION["url"] = configured
+    _PROXY_DECISION["checked_at"] = now
+    return _PROXY_DECISION["url"]
+
+
+def _subprocess_env() -> dict:
+    """Return env for subprocesses.
+
+    We do NOT set HTTPS_PROXY/HTTP_PROXY directly — curl_cffi would then unconditionally
+    route through proxy. Instead we pass the configured URL as CMON_PROXY_URL, and the
+    subprocess scripts try direct first, retry via proxy on network error.
+    """
+    env = os.environ.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        env.pop(key, None)
+    url = _load_proxy_url()
+    if url:
+        env["CMON_PROXY_URL"] = url
+    return env
 
 
 def _find_chrome() -> str | None:
@@ -174,11 +289,12 @@ _LOGIN_SCRIPT = (
 # ---------------------------------------------------------------------------
 
 _FETCH_SCRIPT = (
-    'import json, sys\n'
+    'import json, sys, os\n'
     'from pathlib import Path\n'
     'from curl_cffi import requests\n'
     '\n'
     'auth_file = sys.argv[1]\n'
+    'proxy_url = os.environ.get("CMON_PROXY_URL", "").strip()\n'
     'data = json.loads(Path(auth_file).read_text(encoding="utf-8"))\n'
     '\n'
     'cookies = {}\n'
@@ -190,28 +306,50 @@ _FETCH_SCRIPT = (
     '    print(json.dumps({"error": "no_session"}))\n'
     '    sys.exit(0)\n'
     '\n'
-    'session = requests.Session(impersonate="chrome")\n'
-    'for name, value in cookies.items():\n'
-    '    session.cookies.set(name, value, domain=".claude.ai")\n'
+    'def _mk_session(use_proxy):\n'
+    '    s = requests.Session(impersonate="chrome")\n'
+    '    for name, value in cookies.items():\n'
+    '        s.cookies.set(name, value, domain=".claude.ai")\n'
+    '    if use_proxy and proxy_url:\n'
+    '        s.proxies = {"http": proxy_url, "https": proxy_url}\n'
+    '    return s\n'
     '\n'
-    'try:\n'
-    '    r = session.get("https://claude.ai/api/organizations", timeout=15)\n'
+    'def _do(use_proxy):\n'
+    '    s = _mk_session(use_proxy)\n'
+    '    r = s.get("https://claude.ai/api/organizations", timeout=10)\n'
+    '    if r.status_code in (401, 403):\n'
+    '        return {"error": "session_expired", "status": r.status_code}\n'
     '    if r.status_code != 200:\n'
-    '        print(json.dumps({"error": "session_expired", "status": r.status_code}))\n'
-    '        sys.exit(0)\n'
+    '        return {"error": f"orgs_failed:{r.status_code}"}\n'
     '    orgs = r.json()\n'
     '    org_uuid = orgs[0]["uuid"] if orgs else None\n'
     '    if not org_uuid:\n'
-    '        print(json.dumps({"error": "no_org"}))\n'
-    '        sys.exit(0)\n'
-    '    r2 = session.get(f"https://claude.ai/api/organizations/{org_uuid}/usage", timeout=15)\n'
+    '        return {"error": "no_org"}\n'
+    '    r2 = s.get(f"https://claude.ai/api/organizations/{org_uuid}/usage", timeout=10)\n'
     '    if r2.status_code != 200:\n'
-    '        print(json.dumps({"error": f"usage_fetch_failed:{r2.status_code}"}))\n'
+    '        return {"error": f"usage_fetch_failed:{r2.status_code}"}\n'
+    '    return {"usage": r2.json(), "org_uuid": org_uuid, "via_proxy": bool(use_proxy)}\n'
+    '\n'
+    'direct_err = None\n'
+    'try:\n'
+    '    result = _do(False)\n'
+    '    # If it is a session/auth issue, do not retry via proxy — proxy will not fix it.\n'
+    '    if "error" not in result or result.get("error") == "session_expired":\n'
+    '        print(json.dumps(result))\n'
     '        sys.exit(0)\n'
-    '    usage = r2.json()\n'
-    '    print(json.dumps({"usage": usage, "org_uuid": org_uuid}))\n'
+    '    direct_err = result.get("error")\n'
     'except Exception as e:\n'
-    '    print(json.dumps({"error": str(e)}))\n'
+    '    direct_err = f"{type(e).__name__}:{e}"\n'
+    '\n'
+    'if not proxy_url:\n'
+    '    print(json.dumps({"error": f"direct_failed:{direct_err}"}))\n'
+    '    sys.exit(0)\n'
+    '\n'
+    'try:\n'
+    '    result = _do(True)\n'
+    '    print(json.dumps(result))\n'
+    'except Exception as e:\n'
+    '    print(json.dumps({"error": f"proxy_failed:{type(e).__name__}:{e}; direct_err={direct_err}"}))\n'
 )
 
 
@@ -220,11 +358,10 @@ _FETCH_SCRIPT = (
 # ---------------------------------------------------------------------------
 
 _IDENTITY_SCRIPT = (
-    'import json, sys\n'
+    'import json, sys, os\n'
     'from pathlib import Path\n'
     'from curl_cffi import requests\n'
     '\n'
-    '# capabilities-based plan detection (ordered: most specific first)\n'
     'CAP_PLAN = [\n'
     '    ("claude_max_20", "Max 20"),\n'
     '    ("claude_max_5",  "Max 5"),\n'
@@ -235,24 +372,32 @@ _IDENTITY_SCRIPT = (
     ']\n'
     '\n'
     'auth_file = sys.argv[1]\n'
+    'proxy_url = os.environ.get("CMON_PROXY_URL", "").strip()\n'
     'data = json.loads(Path(auth_file).read_text(encoding="utf-8"))\n'
     'cookies = {c["name"]: c["value"] for c in data.get("cookies", [])\n'
     '           if "claude.ai" in c.get("domain", "")}\n'
     'if not cookies.get("sessionKey"):\n'
     '    print(json.dumps({"error": "no_session"}))\n'
     '    sys.exit(0)\n'
-    'session = requests.Session(impersonate="chrome")\n'
-    'for name, value in cookies.items():\n'
-    '    session.cookies.set(name, value, domain=".claude.ai")\n'
-    'try:\n'
+    '\n'
+    'def _mk_session(use_proxy):\n'
+    '    s = requests.Session(impersonate="chrome")\n'
+    '    for name, value in cookies.items():\n'
+    '        s.cookies.set(name, value, domain=".claude.ai")\n'
+    '    if use_proxy and proxy_url:\n'
+    '        s.proxies = {"http": proxy_url, "https": proxy_url}\n'
+    '    return s\n'
+    '\n'
+    'def _do(use_proxy):\n'
+    '    s = _mk_session(use_proxy)\n'
     '    email, disp_name, plan, uuid = "", "", "", ""\n'
-    '    r = session.get("https://claude.ai/api/account", timeout=15)\n'
+    '    r = s.get("https://claude.ai/api/account", timeout=10)\n'
     '    if r.status_code == 200:\n'
     '        acc = r.json()\n'
     '        email     = acc.get("email_address", "")\n'
     '        disp_name = acc.get("display_name", "") or acc.get("full_name", "")\n'
     '        uuid      = acc.get("uuid", "")\n'
-    '    r2 = session.get("https://claude.ai/api/organizations", timeout=15)\n'
+    '    r2 = s.get("https://claude.ai/api/organizations", timeout=10)\n'
     '    if r2.status_code == 200:\n'
     '        orgs = r2.json()\n'
     '        if orgs:\n'
@@ -267,9 +412,22 @@ _IDENTITY_SCRIPT = (
     '                plan = "Pro"\n'
     '            if not plan:\n'
     '                plan = "Free"\n'
-    '    print(json.dumps({"email": email, "name": disp_name, "plan": plan, "uuid": uuid}))\n'
+    '    return {"email": email, "name": disp_name, "plan": plan, "uuid": uuid}\n'
+    '\n'
+    'try:\n'
+    '    print(json.dumps(_do(False)))\n'
+    '    sys.exit(0)\n'
     'except Exception as e:\n'
-    '    print(json.dumps({"error": str(e)}))\n'
+    '    direct_err = f"{type(e).__name__}:{e}"\n'
+    '\n'
+    'if not proxy_url:\n'
+    '    print(json.dumps({"error": f"direct_failed:{direct_err}"}))\n'
+    '    sys.exit(0)\n'
+    '\n'
+    'try:\n'
+    '    print(json.dumps(_do(True)))\n'
+    'except Exception as e:\n'
+    '    print(json.dumps({"error": f"proxy_failed:{type(e).__name__}:{e}; direct={direct_err}"}))\n'
 )
 
 
@@ -278,11 +436,12 @@ _IDENTITY_SCRIPT = (
 # ---------------------------------------------------------------------------
 
 _PING_SCRIPT = (
-    'import json, sys, uuid\n'
+    'import json, sys, os, uuid\n'
     'from pathlib import Path\n'
     'from curl_cffi import requests\n'
     '\n'
     'auth_file = sys.argv[1]\n'
+    'proxy_url = os.environ.get("CMON_PROXY_URL", "").strip()\n'
     'data = json.loads(Path(auth_file).read_text(encoding="utf-8"))\n'
     '\n'
     'cookies = {}\n'
@@ -294,49 +453,58 @@ _PING_SCRIPT = (
     '    print(json.dumps({"error": "no_session"}))\n'
     '    sys.exit(0)\n'
     '\n'
-    'session = requests.Session(impersonate="chrome")\n'
-    'for name, value in cookies.items():\n'
-    '    session.cookies.set(name, value, domain=".claude.ai")\n'
+    'def _mk_session(use_proxy):\n'
+    '    s = requests.Session(impersonate="chrome")\n'
+    '    for name, value in cookies.items():\n'
+    '        s.cookies.set(name, value, domain=".claude.ai")\n'
+    '    if use_proxy and proxy_url:\n'
+    '        s.proxies = {"http": proxy_url, "https": proxy_url}\n'
+    '    return s\n'
     '\n'
-    'try:\n'
-    '    r = session.get("https://claude.ai/api/organizations", timeout=15)\n'
+    'def _do(use_proxy):\n'
+    '    s = _mk_session(use_proxy)\n'
+    '    r = s.get("https://claude.ai/api/organizations", timeout=10)\n'
     '    if r.status_code != 200:\n'
-    '        print(json.dumps({"error": "session_expired"}))\n'
-    '        sys.exit(0)\n'
+    '        return {"error": "session_expired"}\n'
     '    org_uuid = r.json()[0]["uuid"]\n'
-    '\n'
-    '    # Create a temporary conversation\n'
-    '    r2 = session.post(\n'
+    '    r2 = s.post(\n'
     '        f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations",\n'
     '        json={"name": "", "uuid": str(uuid.uuid4())},\n'
     '        timeout=15,\n'
     '    )\n'
     '    if r2.status_code not in (200, 201):\n'
-    '        print(json.dumps({"error": f"create_conv:{r2.status_code}"}))\n'
-    '        sys.exit(0)\n'
-    '    conv = r2.json()\n'
-    '    conv_uuid = conv["uuid"]\n'
-    '\n'
-    '    # Send a tiny message (this starts the 5h timer)\n'
-    '    r3 = session.post(\n'
+    '        return {"error": f"create_conv:{r2.status_code}"}\n'
+    '    conv_uuid = r2.json()["uuid"]\n'
+    '    s.post(\n'
     '        f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations/{conv_uuid}/completion",\n'
-    '        json={\n'
-    '            "prompt": "\\n\\nHuman: hi\\n\\nAssistant:",\n'
-    '            "model": "claude-sonnet-4-20250514",\n'
-    '            "max_tokens_to_sample": 5,\n'
-    '        },\n'
+    '        json={"prompt": "\\n\\nHuman: hi\\n\\nAssistant:",\n'
+    '              "model": "claude-sonnet-4-20250514",\n'
+    '              "max_tokens_to_sample": 5},\n'
     '        timeout=30,\n'
     '    )\n'
-    '\n'
-    '    # Delete the conversation to clean up\n'
-    '    session.delete(\n'
+    '    s.delete(\n'
     '        f"https://claude.ai/api/organizations/{org_uuid}/chat_conversations/{conv_uuid}",\n'
     '        timeout=15,\n'
     '    )\n'
+    '    return {"ok": True}\n'
     '\n'
-    '    print(json.dumps({"ok": True}))\n'
+    'try:\n'
+    '    result = _do(False)\n'
+    '    if "error" not in result or result.get("error") == "session_expired":\n'
+    '        print(json.dumps(result))\n'
+    '        sys.exit(0)\n'
+    '    direct_err = result.get("error")\n'
     'except Exception as e:\n'
-    '    print(json.dumps({"error": str(e)}))\n'
+    '    direct_err = f"{type(e).__name__}:{e}"\n'
+    '\n'
+    'if not proxy_url:\n'
+    '    print(json.dumps({"error": f"direct_failed:{direct_err}"}))\n'
+    '    sys.exit(0)\n'
+    '\n'
+    'try:\n'
+    '    print(json.dumps(_do(True)))\n'
+    'except Exception as e:\n'
+    '    print(json.dumps({"error": f"proxy_failed:{type(e).__name__}:{e}; direct={direct_err}"}))\n'
 )
 
 
@@ -642,6 +810,7 @@ class LoginThread(QThread):
                 capture_output=True, text=True, timeout=200,
                 encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=_subprocess_env(),
             )
             if proc.returncode != 0:
                 self.failed.emit(proc.stderr[-400:] or "failed")
@@ -670,6 +839,7 @@ class FetchThread(QThread):
                 capture_output=True, text=True, timeout=30,
                 encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=_subprocess_env(),
             )
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr[-400:] or "subprocess failed")
@@ -744,6 +914,7 @@ class IdentityThread(QThread):
                 capture_output=True, text=True, timeout=20,
                 encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=_subprocess_env(),
             )
             if proc.returncode != 0 or not proc.stdout.strip():
                 return
@@ -775,6 +946,7 @@ class PingThread(QThread):
                 capture_output=True, text=True, timeout=45,
                 encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=_subprocess_env(),
             )
             if proc.returncode != 0:
                 self.error.emit(proc.stderr[-300:] or "ping failed")
@@ -796,8 +968,20 @@ class IncidentFetchThread(QThread):
         try:
             url = "https://status.claude.com/api/v2/incidents/unresolved.json"
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
+            configured_proxy = _load_proxy_url()
+            # Try direct first
+            direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                with direct_opener.open(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode())
+            except Exception:
+                if not configured_proxy:
+                    raise
+                proxy_opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": configured_proxy, "https": configured_proxy})
+                )
+                with proxy_opener.open(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
             incidents = []
             for inc in data.get("incidents", []):
                 updates = inc.get("incident_updates", [])
@@ -2311,9 +2495,29 @@ class UsageWindow(QWidget):
 
         menu.addSeparator()
         menu.addAction("Войти снова", self._re_login_browser)
+        configured_proxy = _load_proxy_url()
+        if configured_proxy:
+            proxy_label = f"Прокси (fallback): {configured_proxy}"
+        else:
+            proxy_label = "Прокси: (не задан)"
+        menu.addAction(proxy_label, self._configure_proxy)
         menu.addSeparator()
         menu.addAction("Выйти", QApplication.instance().quit)
         menu.exec_(e.globalPos())
+
+    def _configure_proxy(self):
+        current = _load_proxy_url()
+        url, ok = QInputDialog.getText(
+            self,
+            "Настройка прокси",
+            "URL прокси (пусто — без прокси):\nнапример: http://127.0.0.1:10808",
+            QLineEdit.Normal,
+            current,
+        )
+        if not ok:
+            return
+        _save_proxy_url(url)
+        self._fetch()
 
     def _re_login_browser(self):
         self._show_login()

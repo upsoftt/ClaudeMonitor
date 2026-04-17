@@ -344,5 +344,10 @@ class TrayConsoleClient:
 
 
 def _log(message: str):
-    """Вывод отладочных сообщений в stderr."""
-    print(f"[trayconsole] {message}", file=sys.stderr, flush=True)
+    """Вывод отладочных сообщений в stderr. Толерантен к PyInstaller windowed mode (stderr=None)."""
+    try:
+        if sys.stderr is None:
+            return
+        print(f"[trayconsole] {message}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass

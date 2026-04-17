@@ -45,6 +45,13 @@
 - Управление через Named Pipes: show/hide/refresh/relogin/shutdown
 - Heartbeat для мониторинга процесса
 
+### 6. Поддержка HTTP/HTTPS прокси (реализовано)
+- Файл `proxy.json` рядом с приложением: `{"url": "http://127.0.0.1:10808"}`
+- Fallback: переменные окружения `HTTPS_PROXY` / `HTTP_PROXY`
+- Прокси применяется ко всем исходящим запросам: curl_cffi subprocess (fetch/identity/ping/login) и urllib (Statuspage)
+- Пункт контекстного меню "Прокси: &lt;url&gt;" открывает диалог для смены URL (пустое значение — выключить прокси)
+- Нужен, когда claude.ai/status.claude.com недоступны напрямую и доступ идёт через локальный прокси
+
 ## Технический стек
 - Python 3 + PyQt5
 - curl_cffi (HTTP для API claude.ai)
