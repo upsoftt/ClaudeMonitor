@@ -6,6 +6,7 @@ import os
 import json
 import hashlib
 import subprocess
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
@@ -25,6 +26,7 @@ except ImportError:
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QSystemTrayIcon, QMenu, QAction, QPushButton, QInputDialog, QLineEdit,
+    QCheckBox,
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QFileSystemWatcher
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QCursor
@@ -40,7 +42,7 @@ _STATE_FILE       = _APP_DIR / "window_state.json"
 ACCOUNTS_DIR      = _APP_DIR / "accounts"
 ACCOUNTS_META     = _APP_DIR / "accounts_meta.json"
 PROXY_FILE        = _APP_DIR / "proxy.json"
-COOKIE_BRIDGE_PORT = 19224
+COOKIE_BRIDGE_PORT = 19225  # CookieBridge v2 hub registers claude-monitor consumer with receiver=http://localhost:19225/cookies
 CLAUDE_CODE_CREDS = Path.home() / ".claude" / ".credentials.json"
 
 def _find_venv_python() -> str:
@@ -362,14 +364,25 @@ _IDENTITY_SCRIPT = (
     'from pathlib import Path\n'
     'from curl_cffi import requests\n'
     '\n'
+    '# Primary: org["rate_limit_tier"] (e.g. "default_claude_max_20x" → Max200,\n'
+    '# "default_claude_max_5x" → Max100). Capabilities are too coarse — they\n'
+    '# return only "claude_max" for both $100 and $200 Max plans.\n'
     'CAP_PLAN = [\n'
-    '    ("claude_max_20", "Max 20"),\n'
-    '    ("claude_max_5",  "Max 5"),\n'
     '    ("claude_max",    "Max"),\n'
     '    ("claude_pro",    "Pro"),\n'
     '    ("teams",         "Team"),\n'
     '    ("enterprise",    "Ent"),\n'
     ']\n'
+    '\n'
+    'def _plan_from_tier(rlt):\n'
+    '    rlt = (rlt or "").lower()\n'
+    '    if "max_20x" in rlt: return "Max200"\n'
+    '    if "max_5x"  in rlt: return "Max100"\n'
+    '    if "max"     in rlt: return "Max"\n'
+    '    if "pro"     in rlt: return "Pro"\n'
+    '    if "team"    in rlt: return "Team"\n'
+    '    if "enterprise" in rlt or "ent" in rlt: return "Ent"\n'
+    '    return ""\n'
     '\n'
     'auth_file = sys.argv[1]\n'
     'proxy_url = os.environ.get("CMON_PROXY_URL", "").strip()\n'
@@ -400,14 +413,25 @@ _IDENTITY_SCRIPT = (
     '    r2 = s.get("https://claude.ai/api/organizations", timeout=10)\n'
     '    if r2.status_code == 200:\n'
     '        orgs = r2.json()\n'
+    '        # Pick the user-billable org: prefer one whose billing_type is set\n'
+    '        # (other orgs may be auto_api_evaluation / dev sandboxes).\n'
+    '        org = None\n'
     '        if orgs:\n'
-    '            org  = orgs[0]\n'
-    '            caps = org.get("capabilities", [])\n'
-    '            cap_names = [c if isinstance(c, str) else c.get("name", "") for c in caps]\n'
-    '            for cap_key, plan_name in CAP_PLAN:\n'
-    '                if cap_key in cap_names:\n'
-    '                    plan = plan_name\n'
+    '            for o in orgs:\n'
+    '                if o.get("billing_type"):\n'
+    '                    org = o\n'
     '                    break\n'
+    '            if org is None:\n'
+    '                org = orgs[0]\n'
+    '        if org is not None:\n'
+    '            plan = _plan_from_tier(org.get("rate_limit_tier"))\n'
+    '            if not plan:\n'
+    '                caps = org.get("capabilities", [])\n'
+    '                cap_names = [c if isinstance(c, str) else c.get("name", "") for c in caps]\n'
+    '                for cap_key, plan_name in CAP_PLAN:\n'
+    '                    if cap_key in cap_names:\n'
+    '                        plan = plan_name\n'
+    '                        break\n'
     '            if not plan and org.get("billing_type") == "stripe_subscription":\n'
     '                plan = "Pro"\n'
     '            if not plan:\n'
@@ -517,6 +541,20 @@ class AccountManager:
 
     def __init__(self):
         ACCOUNTS_DIR.mkdir(exist_ok=True)
+        # Time-window bypass for the removed-orgs blacklist. CookieBridge v2 hub
+        # delivers burst pushes for every known profile; a one-shot flag would be
+        # consumed by the first push (typically an already-known account) before
+        # the targeted profile's cookies arrive. The window stays open until a
+        # new account is actually created (lazy-spend).
+        self._bypass_until = 0.0
+
+    def unblock_next_save(self, duration_sec: float = 60.0):
+        """Open a bypass window for the blacklist; called from '+ Добавить'.
+
+        The window survives burst pushes for unrelated profiles and only closes
+        when a new account is created from a blacklisted org (see save_cookies).
+        """
+        self._bypass_until = time.time() + duration_sec
 
     def _load_meta(self) -> dict:
         try:
@@ -602,6 +640,24 @@ class AccountManager:
         if not session_key:
             return None, False
 
+        last_active_org = next(
+            (c["value"] for c in cookies
+             if c.get("name") == "lastActiveOrg" and c.get("value")),
+            "",
+        )
+
+        # Blacklist of orgs the user explicitly removed. Bridge keeps pushing
+        # cookies for active claude.ai tabs, so without this an account
+        # reappears within seconds of being removed. "+ Добавить" opens a
+        # time-window bypass; the window is consumed only when a new account is
+        # actually created (see end of this function), so burst pushes for
+        # already-known profiles don't waste it.
+        bypass_active = time.time() < self._bypass_until
+        if last_active_org and not bypass_active:
+            meta = self._load_meta()
+            if last_active_org in meta.get("removed_orgs", []):
+                return None, False
+
         storage = {"cookies": cookies, "origins": []}
 
         # ── Fast local dedup by stable cookies (no network) ──────────
@@ -633,6 +689,17 @@ class AccountManager:
                 "pending": True,   # hidden until identity confirmed
                 "added_at": datetime.now().isoformat(),
             })
+
+            # New account just bypassed the blacklist (or wasn't in it) —
+            # consume the bypass window and drop this org from removed_orgs so
+            # the next session doesn't have to bypass it again.
+            if bypass_active:
+                self._bypass_until = 0.0
+                if last_active_org:
+                    bl = meta.get("removed_orgs", [])
+                    if last_active_org in bl:
+                        bl.remove(last_active_org)
+                        meta["removed_orgs"] = bl
 
         if meta.get("active") is None:
             meta["active"] = aid
@@ -695,11 +762,29 @@ class AccountManager:
 
     def remove(self, account_id: str):
         meta = self._load_meta()
+        # Capture lastActiveOrg BEFORE deleting the file so future bridge
+        # pushes for this identity can be silently ignored.
+        f = ACCOUNTS_DIR / f"{account_id}.json"
+        org_uuid = ""
+        if f.exists():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                org_uuid = next(
+                    (c["value"] for c in data.get("cookies", [])
+                     if c.get("name") == "lastActiveOrg" and c.get("value")),
+                    "",
+                )
+            except Exception:
+                pass
+
         meta["accounts"] = [a for a in meta["accounts"] if a["id"] != account_id]
         if meta.get("active") == account_id:
             meta["active"] = meta["accounts"][0]["id"] if meta["accounts"] else None
+        if org_uuid:
+            bl = meta.setdefault("removed_orgs", [])
+            if org_uuid not in bl:
+                bl.append(org_uuid)
         self._save_meta(meta)
-        f = ACCOUNTS_DIR / f"{account_id}.json"
         f.unlink(missing_ok=True)
 
     def migrate_legacy(self):
@@ -750,7 +835,8 @@ class CookieBridgeServer(QThread):
                     self_h.end_headers()
 
             def do_POST(self_h):
-                if self_h.path != "/site-cookies/claude":
+                # Accept both legacy (/site-cookies/claude) and CookieBridge v2 (/cookies) paths.
+                if self_h.path not in ("/cookies", "/site-cookies/claude"):
                     self_h.send_response(404)
                     self_h.end_headers()
                     return
@@ -1003,7 +1089,12 @@ class IncidentFetchThread(QThread):
 # Tray icon
 # ---------------------------------------------------------------------------
 
-def _make_pct_icon(pct) -> QIcon:
+def _make_pct_icon(pct, fixed_color: str = "") -> QIcon:
+    """Tray icon showing a numeric percentage.
+
+    pct: number or None (placeholder shows 'C').
+    fixed_color: if set (e.g. '#22d3ee' cyan), overrides the green/yellow/red
+                 traffic-light scheme. Used for the weekly tray icon."""
     sz = 64
     px = QPixmap(sz, sz)
     px.fill(Qt.transparent)
@@ -1014,11 +1105,14 @@ def _make_pct_icon(pct) -> QIcon:
     p.setPen(Qt.NoPen)
     p.drawRoundedRect(0, 0, sz, sz, 4, 4)
     if pct is None:
-        p.setPen(QColor("#4ade80"))
+        p.setPen(QColor(fixed_color or "#4ade80"))
         p.setFont(QFont("Arial", 34, QFont.Bold))
         p.drawText(px.rect(), Qt.AlignCenter, "C")
     else:
-        color = QColor("#4ade80") if pct < 70 else QColor("#facc15") if pct < 90 else QColor("#f87171")
+        if fixed_color:
+            color = QColor(fixed_color)
+        else:
+            color = QColor("#4ade80") if pct < 70 else QColor("#facc15") if pct < 90 else QColor("#f87171")
         p.setPen(color)
         text = f"{pct:.0f}"
         font_size = 38 if len(text) <= 2 else 28
@@ -1026,6 +1120,9 @@ def _make_pct_icon(pct) -> QIcon:
         p.drawText(px.rect(), Qt.AlignCenter, text)
     p.end()
     return QIcon(px)
+
+
+_WEEKLY_TRAY_COLOR = "#22d3ee"  # cyan-400 — turquoise weekly indicator
 
 
 # ---------------------------------------------------------------------------
@@ -1082,7 +1179,7 @@ def _pct_color(pct: float) -> str:
 # Fixed column widths — identical across all row states
 _COL_CHK  = 22   # checkbox indicator
 _COL_NAME = 80   # login (before @)
-_COL_PLAN = 42   # Free / Pro / Max / Max 20
+_COL_PLAN = 42   # Free / Pro / Max / Max100 / Max200
 _COL_SESS = 70   # 5h session
 _COL_WEEK = 70   # 7d limit
 
@@ -1152,7 +1249,8 @@ class _AccountRow(QWidget):
         layout.addWidget(lbl_name)
 
         # ── Plan ──────────────────────────────────────────
-        plan_colors = {"Pro": "#a78bfa", "Max": "#60a5fa", "Max 20": "#38bdf8",
+        plan_colors = {"Pro": "#a78bfa", "Max": "#60a5fa",
+                       "Max100": "#60a5fa", "Max200": "#38bdf8",
                        "Free": "#6b7280", "Team": "#f59e0b", "Enterprise": "#f59e0b"}
         pc = plan_colors.get(plan, "#6b7280")
         lbl_plan = QLabel(plan or "")
@@ -1229,9 +1327,11 @@ class _AccountRow(QWidget):
 
 class UsageWindow(QWidget):
 
-    def __init__(self, tray: QSystemTrayIcon, account_manager: AccountManager):
+    def __init__(self, tray: QSystemTrayIcon, account_manager: AccountManager,
+                 tray_weekly: QSystemTrayIcon = None):
         super().__init__()
         self._tray = tray
+        self._tray_weekly = tray_weekly
         self._account_manager = account_manager
         self._drag = QPoint()
         self._drag_started = False
@@ -1426,6 +1526,17 @@ class UsageWindow(QWidget):
         self._bridge_status_lbl.hide()
         acc_vbox.addWidget(self._bridge_status_lbl)
 
+        # Auto-switch toggle: переключать активный аккаунт при достижении 100%
+        self._chk_auto_switch = QCheckBox("Авто-переключение при исчерпании квоты")
+        self._chk_auto_switch.setStyleSheet("color:#888;font-size:10px;")
+        self._chk_auto_switch.setCursor(QCursor(Qt.PointingHandCursor))
+        self._chk_auto_switch.setToolTip(
+            "Если включено: когда у активного аккаунта 100% сессии или 7-дневного "
+            "лимита, монитор автоматически переключится на лучший доступный."
+        )
+        self._chk_auto_switch.toggled.connect(lambda _: self._save_state())
+        acc_vbox.addWidget(self._chk_auto_switch)
+
         vbox.addWidget(self._accounts_w)
 
         self.adjustSize()
@@ -1610,6 +1721,8 @@ class UsageWindow(QWidget):
         """Add account: pick Chrome profile → open claude.ai/login → wait for CookieBridge."""
         if self._waiting_for_bridge:
             return
+        # Allow the next bridge push to bypass the removed-accounts blacklist.
+        self._account_manager.unblock_next_save()
         profiles = _get_chrome_profiles()
         if len(profiles) > 1:
             self._show_chrome_profile_picker(profiles)
@@ -1955,7 +2068,11 @@ class UsageWindow(QWidget):
 
     def _refresh_missing_identities(self):
         for i, acc in enumerate(self._account_manager.get_all_including_pending()):
-            if not acc.get("email") or not acc.get("plan") or acc.get("pending"):
+            plan = (acc.get("plan") or "").strip()
+            # Re-fetch if plan is missing OR a stale generic "Max" — new
+            # detection upgrades it to "Max100"/"Max200" via rate_limit_tier.
+            stale = (plan == "Max")
+            if not acc.get("email") or not plan or acc.get("pending") or stale:
                 QTimer.singleShot(i * 5000, lambda aid=acc["id"]: self._fetch_identity(aid))
 
     def _associate_cc_tokens_on_startup(self):
@@ -2033,6 +2150,10 @@ class UsageWindow(QWidget):
         """If the active account hit session/weekly 100%, switch to the topmost
         usable account (group 1 in _account_sort_key). No-op if there is no
         better candidate, or if the candidate has no fetched data yet."""
+        # User-controlled toggle — disabled by default.
+        chk = getattr(self, "_chk_auto_switch", None)
+        if chk is None or not chk.isChecked():
+            return
         active_id = self._account_manager.get_active_id()
         if not active_id:
             return
@@ -2389,10 +2510,18 @@ class UsageWindow(QWidget):
                         mm = (secs % 3600) // 60
                         line += f"  {h}:{mm:02d}"
             lines.append(line)
-        self._tray.setToolTip("Claude Usage\n" + "\n".join(lines))
+        tip = "Claude Usage\n" + "\n".join(lines)
+        self._tray.setToolTip(tip)
         session = next((m for m in models if m["name"] == "Сессия"), models[0] if models else None)
         if session:
             self._tray.setIcon(_make_pct_icon(session["pct"]))
+        if self._tray_weekly is not None:
+            self._tray_weekly.setToolTip(tip)
+            weekly = next((m for m in models if m["name"] == "Все модели"), None)
+            if weekly:
+                self._tray_weekly.setIcon(
+                    _make_pct_icon(weekly["pct"], fixed_color=_WEEKLY_TRAY_COLOR)
+                )
 
     # ---- Countdown tick ------------------------------------------
 
@@ -2426,12 +2555,20 @@ class UsageWindow(QWidget):
                 self._enter_compact()
         except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
             self.move(40, 40)
+            data = {}
+        chk = getattr(self, "_chk_auto_switch", None)
+        if chk is not None:
+            chk.blockSignals(True)
+            chk.setChecked(bool(data.get("auto_switch", False)))
+            chk.blockSignals(False)
 
     def _save_state(self):
+        chk = getattr(self, "_chk_auto_switch", None)
         data = {
             "x": self.x(),
             "y": self.y(),
             "compact": self._compact_mode,
+            "auto_switch": bool(chk.isChecked()) if chk is not None else False,
         }
         try:
             _STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
@@ -2879,13 +3016,18 @@ def main():
     tray = QSystemTrayIcon(_make_pct_icon(None), app)
     tray.setToolTip("Claude Usage")
 
+    tray_weekly = QSystemTrayIcon(
+        _make_pct_icon(None, fixed_color=_WEEKLY_TRAY_COLOR), app
+    )
+    tray_weekly.setToolTip("Claude Usage — недельный лимит")
+
     tray_menu = QMenu()
     tray_menu.setStyleSheet(
         "QMenu{background:#1a1a1a;border:1px solid #333;color:#ccc;font-size:11px;}"
         "QMenu::item:selected{background:#333;}"
     )
 
-    win = UsageWindow(tray, account_manager)
+    win = UsageWindow(tray, account_manager, tray_weekly=tray_weekly)
     win._load_state()
     win.show()
 
@@ -2911,11 +3053,15 @@ def main():
     tray_menu.addAction(act_quit)
 
     tray.setContextMenu(tray_menu)
-    tray.activated.connect(
-        lambda reason: (win.show() if win.isHidden() else win.hide())
+    tray_weekly.setContextMenu(tray_menu)
+    _toggle = lambda reason: (
+        (win.show() if win.isHidden() else win.hide())
         if reason == QSystemTrayIcon.Trigger else None
     )
+    tray.activated.connect(_toggle)
+    tray_weekly.activated.connect(_toggle)
     tray.show()
+    tray_weekly.show()
 
     # Fetch all accounts data in background on startup
     QTimer.singleShot(0, win._fetch_all_accounts)
