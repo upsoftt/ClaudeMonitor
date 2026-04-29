@@ -946,19 +946,17 @@ class FetchThread(QThread):
             import traceback
             self.error.emit(self._account_id, f"{exc}\n{traceback.format_exc()[-400:]}")
 
-    # Map API keys → display names. "Opus" used to be "Все модели" — kept that
-    # mapping under "seven_day" since it's the umbrella weekly limit. The two
-    # claude_design keys are alternative API names for Claude Design usage; we
-    # accept either and dedup in _parse so only one row appears.
+    # Map API keys → display names. "seven_day" is the umbrella weekly limit.
+    # Claude Design is internally named "omelette" in the API (verified by
+    # dumping /api/organizations/<uuid>/usage payload).
     _CATEGORIES = {
-        "five_hour":               ("5ч сессия", "session"),
-        "seven_day":               ("7д лимит",  "weekly"),
-        "seven_day_claude_design": ("7д Design", "design"),
-        "claude_design":           ("7д Design", "design"),
-        "seven_day_opus":          ("Opus only", "opus"),
-        "seven_day_sonnet":        ("Sonnet",    "sonnet"),
-        "seven_day_cowork":        ("Cowork",    "cowork"),
-        "seven_day_oauth_apps":    ("OAuth Apps","oauth"),
+        "five_hour":            ("5ч сессия", "session"),
+        "seven_day":            ("7д лимит",  "weekly"),
+        "seven_day_omelette":   ("7д Design", "design"),
+        "seven_day_opus":       ("Opus only", "opus"),
+        "seven_day_sonnet":     ("Sonnet",    "sonnet"),
+        "seven_day_cowork":     ("Cowork",    "cowork"),
+        "seven_day_oauth_apps": ("OAuth Apps","oauth"),
     }
 
     def _parse(self, usage: dict) -> list:
@@ -1194,15 +1192,17 @@ _COL_WEEK   = 60   # 7d limit (Opus)
 _COL_DESIGN = 60   # Claude Design weekly
 
 _SS_CHK_ACTIVE = (
-    "QLabel{color:#4ade80;font-size:12px;font-weight:bold;"
-    "border:1px solid #4ade80;border-radius:2px;"
-    "padding:0px 2px;background:rgba(74,222,128,15);}"
+    "QLabel{color:#4ade80;font-size:13px;font-weight:bold;"
+    "background:transparent;border:none;padding:0;}"
 )
 _SS_CHK_INACTIVE = (
-    "QPushButton{color:#555;font-size:11px;border:1px solid #444;"
-    "border-radius:2px;background:transparent;padding:0px 2px;}"
-    "QPushButton:hover{border-color:#60a5fa;color:#60a5fa;background:rgba(96,165,250,10);}"
+    "QPushButton{color:transparent;font-size:13px;font-weight:bold;"
+    "border:1px solid #3a3a4a;border-radius:3px;"
+    "background:transparent;padding:0;}"
+    "QPushButton:hover{border-color:#4ade80;color:#4ade80;"
+    "background:rgba(74,222,128,15);}"
 )
+_SS_ROW_ACTIVE = "background:#1a1a26;border-radius:4px;"
 
 
 def _login_display(raw: str) -> str:
@@ -1210,6 +1210,43 @@ def _login_display(raw: str) -> str:
     if not raw:
         return "\u2026"
     return raw.split("@")[0] if "@" in raw else raw
+
+
+def _make_check_icon(active: bool, hovered: bool = False, size: int = 16) -> QPixmap:
+    """Round check pill: filled green when active; outlined when not.
+    Drawn at runtime so we don't ship any image assets."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    if active:
+        p.setBrush(QColor("#10b981"))
+        p.setPen(Qt.NoPen)
+    elif hovered:
+        p.setBrush(QColor(74, 222, 128, 30))
+        p.setPen(QColor("#4ade80"))
+    else:
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QColor("#3a3a4a"))
+    inset = 1
+    p.drawEllipse(inset, inset, size - 2 * inset, size - 2 * inset)
+    if active:
+        # White checkmark stroke
+        from PyQt5.QtGui import QPen
+        pen = QPen(QColor("#ffffff"))
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        # Three points: left, mid (low), right (high)
+        s = size
+        x1, y1 = int(s * 0.28), int(s * 0.52)
+        x2, y2 = int(s * 0.45), int(s * 0.68)
+        x3, y3 = int(s * 0.74), int(s * 0.36)
+        p.drawLine(x1, y1, x2, y2)
+        p.drawLine(x2, y2, x3, y3)
+    p.end()
+    return pm
 
 
 class _AccountRow(QWidget):
@@ -1229,35 +1266,60 @@ class _AccountRow(QWidget):
         self._weekly_reset_dt  = None
         self._design_reset_dt  = None
 
+        # Highlight whole row when active. WA_StyledBackground makes the
+        # styled background actually paint on a plain QWidget; without it
+        # Qt only paints styled backgrounds on widgets that opt in.
+        if is_active:
+            self.setObjectName("acc_row_active")
+            self.setAttribute(Qt.WA_StyledBackground, True)
+            self.setStyleSheet(
+                "QWidget#acc_row_active{" + _SS_ROW_ACTIVE + "}"
+            )
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(4, 3, 4, 3)
         layout.setSpacing(0)
 
-        # ── Checkbox ──────────────────────────────────────
+        # ── Checkbox (round pill with check mark, drawn via QPainter) ──
         if is_active:
-            chk = QLabel("\u2713")
-            chk.setStyleSheet(_SS_CHK_ACTIVE)
-            chk.setFixedSize(_COL_CHK, 16)
+            chk = QLabel()
+            chk.setPixmap(_make_check_icon(active=True))
+            chk.setFixedSize(_COL_CHK, 18)
             chk.setAlignment(Qt.AlignCenter)
+            chk.setStyleSheet("background:transparent;border:none;")
         else:
-            chk = QPushButton(" ")
-            chk.setFixedSize(_COL_CHK, 16)
-            chk.setStyleSheet(_SS_CHK_INACTIVE)
+            from PyQt5.QtCore import QSize
+            chk = QPushButton()
+            chk.setFixedSize(_COL_CHK, 18)
+            chk.setIcon(QIcon(_make_check_icon(active=False)))
+            chk.setIconSize(QSize(16, 16))
+            chk.setStyleSheet(
+                "QPushButton{background:transparent;border:none;padding:0;}"
+                "QPushButton:hover{background:transparent;}"
+            )
             chk.setToolTip("Переключиться на этот аккаунт")
             chk.setCursor(QCursor(Qt.PointingHandCursor))
+            def _on_enter(_e, b=chk):
+                b.setIcon(QIcon(_make_check_icon(active=False, hovered=True)))
+            def _on_leave(_e, b=chk):
+                b.setIcon(QIcon(_make_check_icon(active=False, hovered=False)))
+            chk.enterEvent = _on_enter
+            chk.leaveEvent = _on_leave
             chk.clicked.connect(lambda: self.switch_requested.emit(account_id))
         layout.addWidget(chk)
         layout.addSpacing(4)
 
-        # ── Login name ────────────────────────────────────
+        # ── Login name (truncate to 6 chars; full text in tooltip) ──
         login = _login_display(display)
-        short = (login[:12] + "\u2026") if len(login) > 12 else login
+        short = (login[:6] + "\u2026") if len(login) > 6 else login
         lbl_name = QLabel(short)
         lbl_name.setStyleSheet(
             f"color:{'#e8e8e8' if is_active else '#bbb'};font-size:11px;"
             + ("font-weight:600;" if is_active else "")
         )
         lbl_name.setFixedWidth(_COL_NAME)
+        if display and display != short:
+            lbl_name.setToolTip(display)
         layout.addWidget(lbl_name)
 
         # ── Plan ──────────────────────────────────────────
@@ -1276,47 +1338,47 @@ class _AccountRow(QWidget):
             err_col  = {"exp": "#f87171", "timeout": "#facc15", "err": "#fb923c"}.get(error, "#fb923c")
             lbl_err = QLabel(err_text)
             lbl_err.setStyleSheet(f"color:{err_col};font-size:10px;font-style:italic;")
-            lbl_err.setFixedWidth(_COL_SESS + _COL_WEEK)
+            lbl_err.setFixedWidth(_COL_SESS + _COL_WEEK + _COL_DESIGN)
             layout.addWidget(lbl_err)
         else:
-            if session_pct is not None:
-                sc   = _pct_color(session_pct)
-                stxt = f"{session_pct:.0f}%" + (f" ({session_time})" if session_time else "")
-            else:
-                sc, stxt = "#555", "\u2026"
-            self._lbl_sess = QLabel(stxt)
-            self._lbl_sess.setStyleSheet(f"color:{sc};font-size:11px;")
-            self._lbl_sess.setFixedWidth(_COL_SESS)
             self._session_pct = session_pct
+            self._weekly_pct  = weekly_pct
+            self._design_pct  = design_pct
+            self._lbl_sess   = self._make_metric_cell(session_pct, session_time, _COL_SESS)
+            self._lbl_week   = self._make_metric_cell(weekly_pct,  weekly_time,  _COL_WEEK)
+            self._lbl_design = self._make_metric_cell(design_pct,  design_time,  _COL_DESIGN)
             layout.addWidget(self._lbl_sess)
-
-            if weekly_pct is not None:
-                wc   = _pct_color(weekly_pct)
-                wtxt = f"{weekly_pct:.0f}%" + (f" ({weekly_time})" if weekly_time else "")
-            else:
-                wc, wtxt = "#555", "\u2026"
-            self._lbl_week = QLabel(wtxt)
-            self._lbl_week.setStyleSheet(f"color:{wc};font-size:11px;")
-            self._lbl_week.setFixedWidth(_COL_WEEK)
-            self._weekly_pct = weekly_pct
             layout.addWidget(self._lbl_week)
+            layout.addWidget(self._lbl_design)
+
+    @staticmethod
+    def _metric_html(pct, time_text) -> str:
+        if pct is None:
+            return "<span style='color:#555;font-size:11px;'>…</span>"
+        color = _pct_color(pct)
+        html = f"<span style='color:{color};font-size:11px;font-weight:600;'>{pct:.0f}%</span>"
+        if time_text:
+            html += f"<br><span style='color:#777;font-size:9px;'>{time_text}</span>"
+        return html
+
+    def _make_metric_cell(self, pct, time_text, width: int) -> QLabel:
+        lbl = QLabel(self._metric_html(pct, time_text))
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setFixedWidth(width)
+        lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        return lbl
 
     def tick_timers(self):
         """Called every second to update countdown labels without a full rebuild."""
         if hasattr(self, "_lbl_sess") and self._session_reset_dt is not None:
-            t = _fmt_remaining(self._session_reset_dt)
-            pct = self._session_pct
-            sc = _pct_color(pct) if pct is not None else "#555"
-            stxt = (f"{pct:.0f}%" if pct is not None else "…") + (f" ({t})" if t else "")
-            self._lbl_sess.setText(stxt)
-            self._lbl_sess.setStyleSheet(f"color:{sc};font-size:11px;")
+            self._lbl_sess.setText(self._metric_html(
+                self._session_pct, _fmt_remaining(self._session_reset_dt)))
         if hasattr(self, "_lbl_week") and self._weekly_reset_dt is not None:
-            t = _fmt_remaining(self._weekly_reset_dt)
-            pct = self._weekly_pct
-            wc = _pct_color(pct) if pct is not None else "#555"
-            wtxt = (f"{pct:.0f}%" if pct is not None else "…") + (f" ({t})" if t else "")
-            self._lbl_week.setText(wtxt)
-            self._lbl_week.setStyleSheet(f"color:{wc};font-size:11px;")
+            self._lbl_week.setText(self._metric_html(
+                self._weekly_pct, _fmt_remaining(self._weekly_reset_dt)))
+        if hasattr(self, "_lbl_design") and self._design_reset_dt is not None:
+            self._lbl_design.setText(self._metric_html(
+                self._design_pct, _fmt_remaining(self._design_reset_dt)))
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
@@ -1395,7 +1457,7 @@ class UsageWindow(QWidget):
         self._card = _Card(self)
         # Width = CHK+4 + NAME + PLAN + SESS + WEEK + paddings
         self._card.setMinimumWidth(
-            _COL_CHK + 4 + _COL_NAME + _COL_PLAN + _COL_SESS + _COL_WEEK + 30
+            _COL_CHK + 4 + _COL_NAME + _COL_PLAN + _COL_SESS + _COL_WEEK + _COL_DESIGN + 30
         )
         outer.addWidget(self._card)
 
@@ -1517,6 +1579,7 @@ class UsageWindow(QWidget):
         for text, width in [
             ("", _COL_CHK + 4), ("Логин", _COL_NAME), ("Тариф", _COL_PLAN),
             ("5ч сессия", _COL_SESS), ("7д лимит", _COL_WEEK),
+            ("7д Design", _COL_DESIGN),
         ]:
             lbl = QLabel(text)
             lbl.setStyleSheet("color:#888;font-size:10px;")
@@ -1658,7 +1721,7 @@ class UsageWindow(QWidget):
             self._incidents_w.show()
         # Restore minimum width for the full accounts table
         self._card.setMinimumWidth(
-            _COL_CHK + 4 + _COL_NAME + _COL_PLAN + _COL_SESS + _COL_WEEK + 30
+            _COL_CHK + 4 + _COL_NAME + _COL_PLAN + _COL_SESS + _COL_WEEK + _COL_DESIGN + 30
         )
         self.adjustSize()
         self._save_state()
@@ -2475,6 +2538,7 @@ class UsageWindow(QWidget):
             models = self._accounts_data.get(aid, [])
             session_m = next((m for m in models if m["name"] == "5ч сессия"), None)
             weekly_m  = next((m for m in models if m["name"] == "7д лимит"), None)
+            design_m  = next((m for m in models if m["name"] == "7д Design"), None)
 
             session_pct      = session_m["pct"] if session_m else None
             session_reset_dt = session_m["reset_dt"] if session_m else None
@@ -2482,16 +2546,21 @@ class UsageWindow(QWidget):
             weekly_pct       = weekly_m["pct"] if weekly_m else None
             weekly_reset_dt  = weekly_m["reset_dt"] if weekly_m else None
             weekly_time      = _fmt_remaining(weekly_reset_dt)
+            design_pct       = design_m["pct"] if design_m else None
+            design_reset_dt  = design_m["reset_dt"] if design_m else None
+            design_time      = _fmt_remaining(design_reset_dt)
 
             row = _AccountRow(
                 aid, display, is_active,
                 plan=plan,
                 session_pct=session_pct, session_time=session_time,
                 weekly_pct=weekly_pct,   weekly_time=weekly_time,
+                design_pct=design_pct,   design_time=design_time,
                 error=err,
             )
             row._session_reset_dt = session_reset_dt
             row._weekly_reset_dt  = weekly_reset_dt
+            row._design_reset_dt  = design_reset_dt
             row.switch_requested.connect(self._switch_account)
             row.remove_requested.connect(self._remove_account)
             self._acc_rows_layout.addWidget(row)
