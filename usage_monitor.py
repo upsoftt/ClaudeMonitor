@@ -946,19 +946,27 @@ class FetchThread(QThread):
             import traceback
             self.error.emit(self._account_id, f"{exc}\n{traceback.format_exc()[-400:]}")
 
-    # Map API keys → display names
+    # Map API keys → display names. "Opus" used to be "Все модели" — kept that
+    # mapping under "seven_day" since it's the umbrella weekly limit. The two
+    # claude_design keys are alternative API names for Claude Design usage; we
+    # accept either and dedup in _parse so only one row appears.
     _CATEGORIES = {
-        "five_hour":            ("Сессия",     "session"),
-        "seven_day":            ("Все модели", "weekly"),
-        "seven_day_opus":       ("Opus",       "opus"),
-        "seven_day_sonnet":     ("Sonnet",     "sonnet"),
-        "seven_day_cowork":     ("Cowork",     "cowork"),
-        "seven_day_oauth_apps": ("OAuth Apps", "oauth"),
+        "five_hour":               ("5ч сессия", "session"),
+        "seven_day":               ("7д лимит",  "weekly"),
+        "seven_day_claude_design": ("7д Design", "design"),
+        "claude_design":           ("7д Design", "design"),
+        "seven_day_opus":          ("Opus only", "opus"),
+        "seven_day_sonnet":        ("Sonnet",    "sonnet"),
+        "seven_day_cowork":        ("Cowork",    "cowork"),
+        "seven_day_oauth_apps":    ("OAuth Apps","oauth"),
     }
 
     def _parse(self, usage: dict) -> list:
         models = []
+        seen = set()
         for key, (display_name, _tag) in self._CATEGORIES.items():
+            if display_name in seen:
+                continue
             val = usage.get(key)
             if val is None or not isinstance(val, dict):
                 continue
@@ -971,6 +979,7 @@ class FetchThread(QThread):
                 "pct": round(float(pct), 1),
                 "reset_dt": reset_dt,
             })
+            seen.add(display_name)
         return models
 
     def _iso(self, s):
@@ -1177,11 +1186,12 @@ def _pct_color(pct: float) -> str:
 # ---------------------------------------------------------------------------
 
 # Fixed column widths — identical across all row states
-_COL_CHK  = 22   # checkbox indicator
-_COL_NAME = 80   # login (before @)
-_COL_PLAN = 42   # Free / Pro / Max / Max100 / Max200
-_COL_SESS = 70   # 5h session
-_COL_WEEK = 70   # 7d limit
+_COL_CHK    = 22   # checkbox indicator
+_COL_NAME   = 80   # login (before @)
+_COL_PLAN   = 42   # Free / Pro / Max / Max100 / Max200
+_COL_SESS   = 60   # 5h session  (% on top, reset timer below in dim color)
+_COL_WEEK   = 60   # 7d limit (Opus)
+_COL_DESIGN = 60   # Claude Design weekly
 
 _SS_CHK_ACTIVE = (
     "QLabel{color:#4ade80;font-size:12px;font-weight:bold;"
@@ -1210,12 +1220,14 @@ class _AccountRow(QWidget):
                  plan: str = "",
                  session_pct=None, session_time=None,
                  weekly_pct=None, weekly_time=None,
+                 design_pct=None, design_time=None,
                  error: str = None, parent=None):
         super().__init__(parent)
         self.account_id = account_id
         self._is_active = is_active
         self._session_reset_dt = None   # stored for live tick updates
         self._weekly_reset_dt  = None
+        self._design_reset_dt  = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -2160,8 +2172,8 @@ class UsageWindow(QWidget):
         models = self._accounts_data.get(active_id, [])
         if not models:
             return
-        session_m = next((m for m in models if m["name"] == "Сессия"), None)
-        weekly_m  = next((m for m in models if m["name"] == "Все модели"), None)
+        session_m = next((m for m in models if m["name"] == "5ч сессия"), None)
+        weekly_m  = next((m for m in models if m["name"] == "7д лимит"), None)
         session_pct = session_m["pct"] if session_m else 0
         weekly_pct  = weekly_m["pct"]  if weekly_m  else 0
         # Only act when the active account is no longer usable
@@ -2269,14 +2281,14 @@ class UsageWindow(QWidget):
         for acc in self._account_manager.get_all():
             aid = acc["id"]
             models = self._accounts_data.get(aid, [])
-            session_m = next((m for m in models if m["name"] == "Сессия"), None)
+            session_m = next((m for m in models if m["name"] == "5ч сессия"), None)
             if session_m is None:
                 continue
             # Only kick accounts sitting at exactly 0%
             if session_m["pct"] > 0:
                 continue
             # Skip if weekly limit is exhausted — Claude won't respond anyway
-            weekly_m = next((m for m in models if m["name"] == "Все модели"), None)
+            weekly_m = next((m for m in models if m["name"] == "7д лимит"), None)
             if weekly_m and weekly_m["pct"] >= 100:
                 continue
             # Don't re-ping if already in queue
@@ -2316,7 +2328,7 @@ class UsageWindow(QWidget):
             return
         # Re-check: skip if session is no longer 0% (user may have sent a message)
         models = self._accounts_data.get(aid, [])
-        session_m = next((m for m in models if m["name"] == "Сессия"), None)
+        session_m = next((m for m in models if m["name"] == "5ч сессия"), None)
         if session_m and session_m["pct"] > 0:
             self._schedule_next_autopin()
             return
@@ -2404,7 +2416,7 @@ class UsageWindow(QWidget):
             self._body.addWidget(lbl)
         else:
             # Show only the two key metrics in the top section
-            _TOP_KEYS = {"Сессия", "Все модели"}
+            _TOP_KEYS = {"Сессия", "Opus", "Design"}
             for m in models:
                 if m["name"] not in _TOP_KEYS:
                     continue
@@ -2424,8 +2436,8 @@ class UsageWindow(QWidget):
         Inside a group: soonest 5h reset first; tiebreak: higher session usage first."""
         aid = acc["id"]
         models = self._accounts_data.get(aid, [])
-        session_m = next((m for m in models if m["name"] == "Сессия"), None)
-        weekly_m  = next((m for m in models if m["name"] == "Все модели"), None)
+        session_m = next((m for m in models if m["name"] == "5ч сессия"), None)
+        weekly_m  = next((m for m in models if m["name"] == "7д лимит"), None)
         weekly_pct  = weekly_m["pct"]  if weekly_m  else 0
         session_pct = session_m["pct"] if session_m else 0
         if session_m and session_m.get("reset_dt"):
@@ -2461,8 +2473,8 @@ class UsageWindow(QWidget):
             err     = self._accounts_errors.get(aid) if not is_active else None
 
             models = self._accounts_data.get(aid, [])
-            session_m = next((m for m in models if m["name"] == "Сессия"), None)
-            weekly_m  = next((m for m in models if m["name"] == "Все модели"), None)
+            session_m = next((m for m in models if m["name"] == "5ч сессия"), None)
+            weekly_m  = next((m for m in models if m["name"] == "7д лимит"), None)
 
             session_pct      = session_m["pct"] if session_m else None
             session_reset_dt = session_m["reset_dt"] if session_m else None
@@ -2517,7 +2529,7 @@ class UsageWindow(QWidget):
             self._tray.setIcon(_make_pct_icon(session["pct"]))
         if self._tray_weekly is not None:
             self._tray_weekly.setToolTip(tip)
-            weekly = next((m for m in models if m["name"] == "Все модели"), None)
+            weekly = next((m for m in models if m["name"] == "7д лимит"), None)
             if weekly:
                 self._tray_weekly.setIcon(
                     _make_pct_icon(weekly["pct"], fixed_color=_WEEKLY_TRAY_COLOR)
