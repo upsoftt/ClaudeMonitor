@@ -15,7 +15,8 @@ name = "ClaudeMonitor"
 path = "src/main.rs"
 
 [dependencies]
-slint = "1.9"
+slint = { version = "1.9", features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
 # Pure-Rust HTTP client (rustls). Verified 2026-04-29: claude.ai accepts
 # plain rustls TLS — no Chrome fingerprinting needed (see examples/tls_probe.rs).
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "brotli", "rustls-tls", "stream", "socks"] }
@@ -27,6 +28,7 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 image = { version = "0.25", default-features = false, features = ["png"] }
+fontdue = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 md-5 = "0.10"
@@ -46,6 +48,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",

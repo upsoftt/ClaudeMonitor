@@ -5,13 +5,23 @@ import sys
 import os
 import json
 import hashlib
+import hmac
+import secrets
 import subprocess
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import logging
+import logging.handlers
+import faulthandler
+import atexit
+import signal
+import threading
+import traceback
 from pathlib import Path
 from datetime import datetime
 import webbrowser
 import urllib.request
+import urllib.error
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 import psutil
@@ -28,7 +38,10 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon, QMenu, QAction, QPushButton, QInputDialog, QLineEdit,
     QCheckBox,
 )
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QFileSystemWatcher
+from PyQt5.QtCore import (
+    Qt, QTimer, QThread, pyqtSignal, QPoint, QFileSystemWatcher,
+    qInstallMessageHandler, QtMsgType,
+)
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QCursor
 
 # When frozen by PyInstaller, resolve paths relative to the EXE location
@@ -42,8 +55,186 @@ _STATE_FILE       = _APP_DIR / "window_state.json"
 ACCOUNTS_DIR      = _APP_DIR / "accounts"
 ACCOUNTS_META     = _APP_DIR / "accounts_meta.json"
 PROXY_FILE        = _APP_DIR / "proxy.json"
-COOKIE_BRIDGE_PORT = 19225  # CookieBridge v2 hub registers claude-monitor consumer with receiver=http://localhost:19225/cookies
+LOG_DIR           = _APP_DIR / "logs"
 CLAUDE_CODE_CREDS = Path.home() / ".claude" / ".credentials.json"
+
+# ─── Cookie Bridge Hub (consumer pull-mode) ──────────────────────────────────
+# We are a registered HMAC-authenticated consumer that long-polls the hub for
+# fresh .claude.ai cookies. See CookieBridge/CONSUMER_GUIDE.md for protocol.
+CB_HUB_URL          = "http://127.0.0.1:19280"
+CB_CONSUMER_ID      = "claude-monitor"
+CB_CONSUMER_NAME    = "Claude Monitor"
+CB_CONSUMER_DOMAINS = [".claude.ai"]
+CB_RECEIVER_PORT    = 19225
+CB_RECEIVER_PATH    = "/cookies"
+CB_SECRET_FILE      = _APP_DIR / "cb_consumer.json"
+
+
+# ─── Diagnostics / crash logging ─────────────────────────────────────────────
+# pythonw.exe silently discards stdout/stderr — without this scaffold, an
+# unhandled exception, segfault, or external SIGTERM leaves zero trace.
+_FAULT_LOG_FH = None  # kept open for the lifetime of the process (faulthandler)
+_HEARTBEAT_TIMER = None  # GC anchor for the QTimer
+
+
+class _StreamToLogger:
+    """File-like sink that line-buffers writes into a logger.
+
+    Why: under pythonw, sys.stdout/stderr are devnulled. Replacing them with
+    this object routes any stray print() or traceback.print_exc() into app.log.
+    """
+    def __init__(self, logger, level):
+        self._logger = logger
+        self._level = level
+        self._buf = ""
+
+    def write(self, msg):
+        if not isinstance(msg, str):
+            msg = str(msg)
+        self._buf += msg
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip()
+            if line:
+                self._logger.log(self._level, line)
+
+    def flush(self):
+        if self._buf.strip():
+            self._logger.log(self._level, self._buf.rstrip())
+            self._buf = ""
+
+    def isatty(self):
+        return False
+
+
+def _qt_message_handler(msg_type, context, message):
+    level = {
+        QtMsgType.QtDebugMsg:    logging.DEBUG,
+        QtMsgType.QtInfoMsg:     logging.INFO,
+        QtMsgType.QtWarningMsg:  logging.WARNING,
+        QtMsgType.QtCriticalMsg: logging.ERROR,
+        QtMsgType.QtFatalMsg:    logging.CRITICAL,
+    }.get(msg_type, logging.INFO)
+    where = ""
+    if getattr(context, "file", None):
+        where = f" [{context.file}:{context.line}]"
+    logging.getLogger("Qt").log(level, "%s%s", message, where)
+
+
+def _init_logging():
+    """Install file logging + every crash hook we can reach.
+
+    Called as the first line of main(). Idempotent — guarded by an attribute
+    on the function object so that re-imports during PyInstaller bootstrap
+    don't reinitialize and lose the rotating handler state.
+    """
+    if getattr(_init_logging, "_done", False):
+        return
+    _init_logging._done = True
+
+    global _FAULT_LOG_FH
+
+    LOG_DIR.mkdir(exist_ok=True)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_h = logging.handlers.RotatingFileHandler(
+        LOG_DIR / "app.log",
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_h.setFormatter(fmt)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(file_h)
+
+    # Route stray prints / Python's default uncaught-exception printer into the log
+    sys.stdout = _StreamToLogger(logging.getLogger("stdout"), logging.INFO)
+    sys.stderr = _StreamToLogger(logging.getLogger("stderr"), logging.ERROR)
+
+    # Hard crashes (segfault / abort from PyQt5 C++ side) — needs a real fd
+    try:
+        _FAULT_LOG_FH = open(LOG_DIR / "fault.log", "a", encoding="utf-8")
+        faulthandler.enable(file=_FAULT_LOG_FH)
+    except Exception as e:
+        logging.warning("faulthandler.enable failed: %s", e)
+
+    # Uncaught exception in main thread
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logging.critical(
+            "UNCAUGHT EXCEPTION:\n%s",
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
+        )
+    sys.excepthook = _excepthook
+
+    # Uncaught exception in worker QThread / threading.Thread (Py 3.8+)
+    if hasattr(threading, "excepthook"):
+        def _thread_excepthook(args):
+            tname = args.thread.name if args.thread else "?"
+            logging.critical(
+                "UNCAUGHT THREAD EXCEPTION in %s:\n%s",
+                tname,
+                "".join(traceback.format_exception(
+                    args.exc_type, args.exc_value, args.exc_traceback)),
+            )
+        threading.excepthook = _thread_excepthook
+
+    qInstallMessageHandler(_qt_message_handler)
+
+    # Signal handlers — log who is killing us. Try graceful Qt quit, fall back to exit.
+    def _make_sig_handler(name):
+        def handler(signum, frame):
+            logging.warning("SIGNAL received: %s — quitting", name)
+            qapp = QApplication.instance()
+            if qapp is not None:
+                qapp.quit()
+            else:
+                sys.exit(0)
+        return handler
+    for sig_name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _make_sig_handler(sig_name))
+        except (ValueError, OSError):
+            pass
+
+    atexit.register(lambda: logging.info(
+        "ATEXIT — Python interpreter exiting (pid=%d)", os.getpid()))
+
+    try:
+        from PyQt5.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+        qt_ver = f"PyQt5 {PYQT_VERSION_STR}, Qt {QT_VERSION_STR}"
+    except Exception:
+        qt_ver = "PyQt5 ?"
+    logging.info("════════════════════════════════════════════")
+    logging.info("ClaudeMonitor START pid=%d", os.getpid())
+    logging.info("Python %s on %s", sys.version.split()[0], sys.platform)
+    logging.info(qt_ver)
+    logging.info("APP_DIR=%s frozen=%s", _APP_DIR, getattr(sys, "frozen", False))
+    logging.info("LOG_DIR=%s", LOG_DIR)
+
+
+def _start_heartbeat(app):
+    """Once-per-minute alive-pulse. The timestamp of the last heartbeat marks
+    the death window when the app crashes silently between pulses."""
+    global _HEARTBEAT_TIMER
+    counter = {"n": 0}
+    def beat():
+        counter["n"] += 1
+        logging.info("heartbeat #%d threads=%d",
+                     counter["n"], threading.active_count())
+    _HEARTBEAT_TIMER = QTimer(app)
+    _HEARTBEAT_TIMER.timeout.connect(beat)
+    _HEARTBEAT_TIMER.start(60_000)
+    beat()  # first pulse right after startup so the file is non-empty immediately
 
 def _find_venv_python() -> str:
     """Find a real python.exe for subprocesses.
@@ -800,25 +991,202 @@ class AccountManager:
 
 
 # ---------------------------------------------------------------------------
-# CookieBridge server (receives cookies pushed by Chrome extension)
+# CookieBridge consumer (push-mode HMAC receiver, Hub on :19280 → us on :19225)
 # ---------------------------------------------------------------------------
+# We register once with the Hub as a push-mode consumer with wildcard profiles
+# (`["*"]`). The Hub then signs every push with HMAC-SHA256 and POSTs it to
+# `receiver.url`. We verify the signature and extract cookies. Pull-mode would
+# also work but the Hub rejects wildcard profiles in pull-mode, and ClaudeMonitor
+# legitimately consumes any Chrome profile the user logs into. Protocol details:
+# CookieBridge/CONSUMER_GUIDE.md (§4 push-mode).
 
-class CookieBridgeServer(QThread):
-    cookies_received = pyqtSignal(list)   # list of cookie dicts
+CB_TS_TOLERANCE_SEC = 90  # accept hub clocks ±90s vs ours
+
+
+def _cb_load_secret() -> tuple:
+    """Return (consumer_id, secret) from disk, or (None, None) if absent."""
+    if not CB_SECRET_FILE.exists():
+        return None, None
+    try:
+        data = json.loads(CB_SECRET_FILE.read_text(encoding="utf-8"))
+        return data.get("id"), data.get("secret")
+    except Exception as e:
+        logging.warning("cb_consumer.json unreadable: %s", e)
+        return None, None
+
+
+def _cb_save_secret(consumer_id: str, secret: str) -> None:
+    CB_SECRET_FILE.write_text(
+        json.dumps({"id": consumer_id, "secret": secret}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _cb_register(receiver_url: str) -> tuple:
+    """POST /register with push-mode manifest. Returns (id, secret, error_msg).
+    `receiver_url` is where the Hub will POST signed pushes."""
+    manifest = {
+        "id":            CB_CONSUMER_ID,
+        "displayName":   CB_CONSUMER_NAME,
+        "domains":       CB_CONSUMER_DOMAINS,
+        "profiles":      ["*"],
+        "receiver":      {"url": receiver_url},
+        "schemaVersion": "1.0",
+    }
+    body = json.dumps(manifest).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            CB_HUB_URL + "/register",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("id"), data.get("secret"), ""
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        return None, None, f"HTTP {e.code}: {err_body[:200]}"
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"
+
+
+def _cb_verify_hmac(secret: str, ts: str, nonce: str, method: str,
+                    path: str, body_bytes: bytes, signature: str) -> bool:
+    """Verify Hub's HMAC signature on an incoming push.
+
+    Canonical message: <ts>\\n<nonce>\\nPOST\\n<path>\\n<body bytes>
+    Header format: `sha256=<hex>` (case-insensitive).
+    """
+    if not signature or not signature.lower().startswith("sha256="):
+        return False
+    try:
+        provided = bytes.fromhex(signature.split("=", 1)[1])
+    except ValueError:
+        return False
+    try:
+        ts_int = int(ts)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts_int) > CB_TS_TOLERANCE_SEC:
+        return False
+    if not nonce or len(nonce) < 8:
+        return False
+
+    canonical = f"{ts}\n{nonce}\n{method}\n{path}\n".encode("utf-8") + body_bytes
+    expected = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).digest()
+    return hmac.compare_digest(provided, expected)
+
+
+def _cb_extract_cookie_lists(payload: dict) -> list:
+    """Normalize the various push-payload shapes the Hub may use into a list
+    of per-account cookie lists.
+
+    Accepted shapes (any of):
+        {"snapshots": [{"cookies": [...], "domain": ".claude.ai"}, ...]}
+        {"cookies": [...]}                  (single snapshot envelope)
+        {"snapshot": {"cookies": [...]}}    (single named)
+    """
+    out = []
+    snapshots = payload.get("snapshots")
+    if isinstance(snapshots, list):
+        for snap in snapshots:
+            if not isinstance(snap, dict):
+                continue
+            dom = snap.get("domain", "")
+            if dom and dom != ".claude.ai":
+                continue
+            cookies = snap.get("cookies") or []
+            if cookies:
+                out.append(cookies)
+        return out
+
+    snap = payload.get("snapshot")
+    if isinstance(snap, dict):
+        cookies = snap.get("cookies") or []
+        if cookies:
+            out.append(cookies)
+        return out
+
+    cookies = payload.get("cookies")
+    if isinstance(cookies, list) and cookies:
+        out.append(cookies)
+    return out
+
+
+class CookieBridgeConsumer(QThread):
+    """Push-mode receiver: registers with the Hub, then runs an HTTP server on
+    `127.0.0.1:CB_RECEIVER_PORT` that accepts HMAC-signed pushes from the Hub
+    and emits per-account cookie lists.
+    """
+
+    cookies_received = pyqtSignal(list)   # one snapshot's cookie list (claude.ai)
+    status_changed   = pyqtSignal(str)    # human-readable state
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._server = None
+        self._consumer_id = None
+        self._secret = None
+
+    def request_refresh(self):
+        """No-op in push mode — kept for API parity with the pull variant.
+        New cookies arrive whenever the extension pushes; nothing to trigger."""
+        pass
+
+    def stop(self):
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+            except Exception:
+                pass
+
+    def _emit_status(self, msg):
+        logging.info("CookieBridge: %s", msg)
+        self.status_changed.emit(msg)
+
+    def _ensure_credentials(self) -> bool:
+        receiver_url = f"http://127.0.0.1:{CB_RECEIVER_PORT}{CB_RECEIVER_PATH}"
+        cid, secret = _cb_load_secret()
+        if cid and secret:
+            self._consumer_id, self._secret = cid, secret
+            return True
+
+        self._emit_status("Регистрация в CookieBridge Hub…")
+        cid, secret, err = _cb_register(receiver_url)
+        if not cid or not secret:
+            self._emit_status(f"Регистрация не удалась: {err}")
+            logging.error("CookieBridge register failed: %s", err)
+            return False
+        _cb_save_secret(cid, secret)
+        self._consumer_id, self._secret = cid, secret
+        self._emit_status("Зарегистрирован, ждём одобрения в TrayConsole…")
+        return True
 
     def run(self):
-        sig = self.cookies_received
+        logging.info("CookieBridge push-receiver thread starting")
+        if not self._ensure_credentials():
+            return  # cannot proceed; app keeps working without bridge
+
+        secret = self._secret
+        emit_status = self._emit_status
+        emit_cookies = self.cookies_received
 
         class _Handler(BaseHTTPRequestHandler):
+            def _cors(self_h):
+                self_h.send_header("Access-Control-Allow-Origin", "*")
+                self_h.send_header("Access-Control-Allow-Methods",
+                                   "GET, POST, OPTIONS")
+                self_h.send_header("Access-Control-Allow-Headers",
+                                   "Content-Type, X-CB-Timestamp, "
+                                   "X-CB-Nonce, X-CB-Signature")
+
             def do_OPTIONS(self_h):
                 self_h.send_response(200)
-                self_h.send_header("Access-Control-Allow-Origin", "*")
-                self_h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self_h.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self_h._cors()
                 self_h.end_headers()
 
             def do_GET(self_h):
@@ -826,7 +1194,7 @@ class CookieBridgeServer(QThread):
                     body = b'{"ok":true,"app":"ClaudeMonitor"}'
                     self_h.send_response(200)
                     self_h.send_header("Content-Type", "application/json")
-                    self_h.send_header("Access-Control-Allow-Origin", "*")
+                    self_h._cors()
                     self_h.send_header("Content-Length", str(len(body)))
                     self_h.end_headers()
                     self_h.wfile.write(body)
@@ -835,45 +1203,81 @@ class CookieBridgeServer(QThread):
                     self_h.end_headers()
 
             def do_POST(self_h):
-                # Accept both legacy (/site-cookies/claude) and CookieBridge v2 (/cookies) paths.
-                if self_h.path not in ("/cookies", "/site-cookies/claude"):
+                if self_h.path != CB_RECEIVER_PATH:
                     self_h.send_response(404)
                     self_h.end_headers()
                     return
                 try:
                     length = int(self_h.headers.get("Content-Length", 0))
-                    body = json.loads(self_h.rfile.read(length))
-                    self_h.send_response(200)
-                    self_h.send_header("Content-Type", "application/json")
-                    self_h.send_header("Access-Control-Allow-Origin", "*")
-                    self_h.end_headers()
-                    self_h.wfile.write(b'{"ok":true}')
-                    cookies = body.get("cookies", [])
-                    if cookies:
-                        sig.emit(cookies)
+                    body = self_h.rfile.read(length) if length else b""
                 except Exception:
-                    try:
-                        self_h.send_response(400)
-                        self_h.end_headers()
-                    except Exception:
-                        pass
+                    self_h.send_response(400)
+                    self_h.end_headers()
+                    return
+
+                ts    = self_h.headers.get("X-CB-Timestamp", "")
+                nonce = self_h.headers.get("X-CB-Nonce", "")
+                sig   = self_h.headers.get("X-CB-Signature", "")
+
+                if not _cb_verify_hmac(secret, ts, nonce, "POST",
+                                       CB_RECEIVER_PATH, body, sig):
+                    logging.warning(
+                        "CookieBridge push REJECTED — bad HMAC (ts=%s nonce_len=%d sig_prefix=%s)",
+                        ts, len(nonce), sig[:14])
+                    self_h.send_response(401)
+                    self_h._cors()
+                    self_h.end_headers()
+                    return
+
+                try:
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                except Exception as e:
+                    logging.warning("CookieBridge push: bad JSON: %s", e)
+                    self_h.send_response(400)
+                    self_h._cors()
+                    self_h.end_headers()
+                    return
+
+                cookie_lists = _cb_extract_cookie_lists(payload)
+                self_h.send_response(200)
+                self_h.send_header("Content-Type", "application/json")
+                self_h._cors()
+                self_h.end_headers()
+                self_h.wfile.write(b'{"ok":true}')
+
+                if cookie_lists:
+                    emit_status(f"Push принят: {len(cookie_lists)} аккаунт(ов)")
+                    for cookies in cookie_lists:
+                        emit_cookies.emit(cookies)
+                else:
+                    logging.info(
+                        "CookieBridge push: 0 cookie lists in payload keys=%s",
+                        list(payload.keys()))
 
             def log_message(self_h, *args):
-                pass  # suppress server logs
+                pass  # don't pollute stderr; we have our own logging
 
         class _Server(HTTPServer):
             allow_reuse_address = True
+            daemon_threads = True
 
         try:
-            self._server = _Server(("localhost", COOKIE_BRIDGE_PORT), _Handler)
-            self._server.serve_forever()
-        except OSError:
-            pass  # port already in use — extension will still push when server starts
+            self._server = _Server(("127.0.0.1", CB_RECEIVER_PORT), _Handler)
+        except OSError as e:
+            self._emit_status(f"Порт {CB_RECEIVER_PORT} занят: {e}")
+            logging.error("CookieBridge bind :%d failed: %s", CB_RECEIVER_PORT, e)
+            return
 
-    def stop(self):
-        if self._server:
-            self._server.shutdown()
-            self._server = None
+        self._emit_status(
+            f"Слушаем push'ы на :{CB_RECEIVER_PORT}, consumer={self._consumer_id}")
+        try:
+            self._server.serve_forever()
+        finally:
+            try:
+                self._server.server_close()
+            except Exception:
+                pass
+            logging.info("CookieBridge push-receiver thread stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -1309,16 +1713,17 @@ class _AccountRow(QWidget):
         layout.addWidget(chk)
         layout.addSpacing(4)
 
-        # ── Login name (truncate to 6 chars; full text in tooltip) ──
+        # ── Login name (clipped to column width; full text in tooltip) ──
         login = _login_display(display)
-        short = (login[:6] + "\u2026") if len(login) > 6 else login
-        lbl_name = QLabel(short)
+        lbl_name = QLabel(login)
         lbl_name.setStyleSheet(
             f"color:{'#e8e8e8' if is_active else '#bbb'};font-size:11px;"
             + ("font-weight:600;" if is_active else "")
         )
         lbl_name.setFixedWidth(_COL_NAME)
-        if display and display != short:
+        lbl_name.setWordWrap(False)
+        lbl_name.setTextFormat(Qt.PlainText)
+        if display:
             lbl_name.setToolTip(display)
         layout.addWidget(lbl_name)
 
@@ -3085,6 +3490,8 @@ def _setup_trayconsole(win):
 
 
 def main():
+    _init_logging()
+    logging.info("main() entered, killing any previous instances")
     _kill_previous_instances()
 
     account_manager = AccountManager()
@@ -3092,7 +3499,19 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet("* { outline: none; }")
+    app.aboutToQuit.connect(
+        lambda: logging.info("Qt aboutToQuit — event loop closing"))
+    _start_heartbeat(app)
+    app.setStyleSheet(
+        "* { outline: none; }"
+        "QToolTip {"
+        " color: #e8e8e8;"
+        " background-color: #1e1e2e;"
+        " border: 1px solid #3a3a4a;"
+        " padding: 4px 6px;"
+        " font-size: 11px;"
+        "}"
+    )
 
     tray = QSystemTrayIcon(_make_pct_icon(None), app)
     tray.setToolTip("Claude Usage")
@@ -3112,24 +3531,33 @@ def main():
     win._load_state()
     win.show()
 
-    # Start CookieBridge server — always listening for extension pushes
-    bridge = CookieBridgeServer(app)
+    # Start CookieBridge consumer — pull-mode HMAC client of Hub on :19280
+    bridge = CookieBridgeConsumer(app)
     bridge.cookies_received.connect(win.on_bridge_cookies)
     bridge.start()
     app.aboutToQuit.connect(bridge.stop)
+    win._cb_bridge = bridge  # so login flows can call request_refresh()
 
     _setup_trayconsole(win)
 
     act_show  = QAction("Показать / Скрыть", app)
     act_ref   = QAction("Обновить", app)
+    act_logs  = QAction("Открыть папку логов", app)
     act_quit  = QAction("Выйти", app)
 
     act_show.triggered.connect(lambda: win.show() if win.isHidden() else win.hide())
     act_ref.triggered.connect(win._fetch)
+    def _open_logs():
+        try:
+            os.startfile(str(LOG_DIR))
+        except Exception as e:
+            logging.warning("open logs folder failed: %s", e)
+    act_logs.triggered.connect(_open_logs)
     act_quit.triggered.connect(app.quit)
 
     tray_menu.addAction(act_show)
     tray_menu.addAction(act_ref)
+    tray_menu.addAction(act_logs)
     tray_menu.addSeparator()
     tray_menu.addAction(act_quit)
 

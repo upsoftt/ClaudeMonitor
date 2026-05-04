@@ -5,7 +5,9 @@
 //! Icon → push into the OS tray. Re-render whenever percent changes.
 
 use anyhow::Result;
+use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
+use once_cell::sync::Lazy;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIcon, TrayIconBuilder,
@@ -24,9 +26,28 @@ fn color_for(pct: f64) -> Rgba<u8> {
     }
 }
 
+/// Cyan colour the Python build uses for the weekly-limit tray icon.
+pub const WEEKLY_COLOR: Rgba<u8> = Rgba([0x22, 0xd3, 0xee, 0xff]); // #22d3ee
+
+/// System font cache. Tries Arial Bold → Segoe UI Bold → Arial. None → bitmap fallback.
+static SYS_BOLD_FONT: Lazy<Option<Font>> = Lazy::new(|| {
+    let candidates = [
+        r"C:\Windows\Fonts\arialbd.ttf",   // Arial Bold (matches Python QFont)
+        r"C:\Windows\Fonts\segoeuib.ttf",  // Segoe UI Bold
+        r"C:\Windows\Fonts\arial.ttf",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                return Some(font);
+            }
+        }
+    }
+    None
+});
+
 /// Build a 64×64 PNG-style buffer: rounded black background + centred number.
-/// Glyphs are drawn pixel-by-pixel from a built-in 5×7 bitmap font (no
-/// rusttype dependency — keeps the binary tiny).
+/// Tries Arial Bold via fontdue; falls back to a tiny built-in 5×7 bitmap.
 pub fn render_pct_icon(pct: Option<f64>, override_color: Option<Rgba<u8>>) -> RgbaImage {
     let mut img: RgbaImage = ImageBuffer::from_pixel(ICON_SIZE, ICON_SIZE, Rgba([0, 0, 0, 0]));
     draw_rounded_rect(&mut img, Rgba([0, 0, 0, 0xff]), 4);
@@ -38,13 +59,76 @@ pub fn render_pct_icon(pct: Option<f64>, override_color: Option<Rgba<u8>>) -> Rg
             (display, override_color.unwrap_or_else(|| color_for(p)))
         }
     };
-    draw_text_centered(&mut img, &text, color);
+    if let Some(font) = SYS_BOLD_FONT.as_ref() {
+        draw_text_ttf(&mut img, font, &text, color);
+    } else {
+        draw_text_centered(&mut img, &text, color);
+    }
     img
+}
+
+/// Render text via fontdue at a centered baseline. Composites alpha into RGBA.
+fn draw_text_ttf(img: &mut RgbaImage, font: &Font, text: &str, color: Rgba<u8>) {
+    // Mirror Python: 38pt for ≤2 digits, 28pt for 3. Pixel-size approx = pt * 96/72.
+    let px_size: f32 = if text.chars().count() <= 2 { 50.0 } else { 38.0 };
+
+    // First pass: total advance width and max ascent/descent.
+    let metrics: Vec<_> = text.chars().map(|c| font.metrics(c, px_size)).collect();
+    let total_w: f32 = metrics.iter().map(|m| m.advance_width).sum();
+    let max_ascent: f32 = metrics
+        .iter()
+        .map(|m| (m.height as i32 + m.ymin) as f32)
+        .fold(0.0_f32, f32::max);
+
+    let start_x = ((ICON_SIZE as f32 - total_w) / 2.0).max(0.0);
+    // Vertically center the bounding box of the rendered glyphs.
+    let max_h: f32 = metrics.iter().map(|m| m.height as f32).fold(0.0_f32, f32::max);
+    let baseline_y = (ICON_SIZE as f32 - max_h) / 2.0 + max_ascent;
+
+    let [r, g, b, _a] = color.0;
+    let mut pen_x = start_x;
+    for ch in text.chars() {
+        let (m, bitmap) = font.rasterize(ch, px_size);
+        let glyph_left = pen_x + m.xmin as f32;
+        // ymin in fontdue is the glyph's distance below the baseline (negative for descenders).
+        let glyph_top = baseline_y - (m.height as f32 + m.ymin as f32);
+        for y in 0..m.height {
+            for x in 0..m.width {
+                let alpha = bitmap[y * m.width + x];
+                if alpha == 0 {
+                    continue;
+                }
+                let px = (glyph_left as i32 + x as i32) as i32;
+                let py = (glyph_top as i32 + y as i32) as i32;
+                if px >= 0 && py >= 0 && (px as u32) < ICON_SIZE && (py as u32) < ICON_SIZE {
+                    blend(img, px as u32, py as u32, [r, g, b, alpha]);
+                }
+            }
+        }
+        pen_x += m.advance_width;
+    }
+}
+
+/// Source-over alpha blend a single pixel.
+fn blend(img: &mut RgbaImage, x: u32, y: u32, src: [u8; 4]) {
+    let dst = img.get_pixel(x, y).0;
+    let sa = src[3] as u32;
+    let inv = 255 - sa;
+    let r = ((src[0] as u32 * sa + dst[0] as u32 * inv) / 255) as u8;
+    let g = ((src[1] as u32 * sa + dst[1] as u32 * inv) / 255) as u8;
+    let b = ((src[2] as u32 * sa + dst[2] as u32 * inv) / 255) as u8;
+    let a = (sa + dst[3] as u32 * inv / 255).min(255) as u8;
+    img.put_pixel(x, y, Rgba([r, g, b, a]));
 }
 
 /// Encode the rendered image to PNG bytes for `tray-icon::Icon::from_rgba`.
 pub fn build_icon(pct: Option<f64>) -> Result<Icon> {
-    let img = render_pct_icon(pct, None);
+    build_icon_with_color(pct, None)
+}
+
+/// Build an Icon with an optional fixed colour (used for the weekly cyan icon).
+pub fn build_icon_with_color(pct: Option<f64>, override_color: Option<Rgba<u8>>) -> Result<Icon> {
+    let img = render_pct_icon(pct, override_color);
     let (w, h) = img.dimensions();
     let rgba = img.into_raw();
     Ok(Icon::from_rgba(rgba, w, h)?)
@@ -54,13 +138,14 @@ pub fn build_icon(pct: Option<f64>) -> Result<Icon> {
 /// (must stay alive for the lifetime of the app) and the IDs of the
 /// hand-crafted menu items so callers can match `MenuEvent`s.
 pub struct TrayHandle {
-    pub tray: TrayIcon,
+    pub session: TrayIcon,                        // 5h session icon (traffic-light)
+    pub weekly: TrayIcon,                         // 7d weekly icon (always cyan)
     pub show_id: tray_icon::menu::MenuId,
     pub add_id: tray_icon::menu::MenuId,
     pub quit_id: tray_icon::menu::MenuId,
 }
 
-pub fn build(initial_pct: Option<f64>) -> Result<TrayHandle> {
+pub fn build(session_pct: Option<f64>, weekly_pct: Option<f64>) -> Result<TrayHandle> {
     let menu = Menu::new();
     let show = MenuItem::new("Открыть", true, None);
     let add = MenuItem::new("+ Добавить аккаунт", true, None);
@@ -68,18 +153,84 @@ pub fn build(initial_pct: Option<f64>) -> Result<TrayHandle> {
     let quit = MenuItem::new("Выход", true, None);
     menu.append_items(&[&show, &add, &sep, &quit])?;
 
-    let tray = TrayIconBuilder::new()
-        .with_tooltip("Claude Monitor")
-        .with_icon(build_icon(initial_pct)?)
+    // Both icons share the SAME menu (right-click on either opens the same).
+    let session = TrayIconBuilder::new()
+        .with_tooltip("5-часовая сессия")
+        .with_icon(build_icon(session_pct)?)
+        .with_menu(Box::new(clone_menu(&menu, &show, &add, &sep, &quit)?))
+        .with_menu_on_left_click(false)
+        .build()?;
+
+    let weekly = TrayIconBuilder::new()
+        .with_tooltip("7-дневный лимит")
+        .with_icon(build_icon_with_color(weekly_pct, Some(WEEKLY_COLOR))?)
         .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
         .build()?;
 
     Ok(TrayHandle {
-        tray,
+        session,
+        weekly,
         show_id: show.id().clone(),
         add_id: add.id().clone(),
         quit_id: quit.id().clone(),
     })
+}
+
+/// tray-icon `Menu` items can't be shared between two TrayIcons (each tray
+/// takes ownership of the Menu). We build a second menu instance with the
+/// same labels but separate items — the IDs are still tracked from the
+/// originals so dispatch works for the cyan tray's menu too.
+fn clone_menu(
+    _orig: &Menu,
+    _show: &MenuItem,
+    _add: &MenuItem,
+    _sep: &PredefinedMenuItem,
+    _quit: &MenuItem,
+) -> Result<Menu> {
+    let m = Menu::new();
+    let s = MenuItem::with_id(_show.id().clone(), "Открыть", true, None);
+    let a = MenuItem::with_id(_add.id().clone(), "+ Добавить аккаунт", true, None);
+    let p = PredefinedMenuItem::separator();
+    let q = MenuItem::with_id(_quit.id().clone(), "Выход", true, None);
+    m.append_items(&[&s, &a, &p, &q])?;
+    Ok(m)
+}
+
+/// Update the session tray icon and tooltip.
+/// `reset_text` is the pre-formatted "Xч Yм" / "Xд Yч" string from
+/// `format_remaining`; empty means "no reset data available".
+pub fn update_session(
+    handle: &TrayHandle,
+    pct: Option<f64>,
+    reset_text: &str,
+) -> Result<()> {
+    handle.session.set_icon(Some(build_icon(pct)?))?;
+    let tip = if reset_text.is_empty() {
+        "5-часовая сессия".to_string()
+    } else {
+        format!("5-часовая сессия — {reset_text} до сброса")
+    };
+    handle.session.set_tooltip(Some(tip))?;
+    Ok(())
+}
+
+/// Update the weekly tray icon (always cyan) and tooltip.
+pub fn update_weekly(
+    handle: &TrayHandle,
+    pct: Option<f64>,
+    reset_text: &str,
+) -> Result<()> {
+    handle
+        .weekly
+        .set_icon(Some(build_icon_with_color(pct, Some(WEEKLY_COLOR))?))?;
+    let tip = if reset_text.is_empty() {
+        "7-дневный лимит".to_string()
+    } else {
+        format!("7-дневный лимит — {reset_text} до сброса")
+    };
+    handle.weekly.set_tooltip(Some(tip))?;
+    Ok(())
 }
 
 /// Pump menu events into a channel. Call once at startup. The receiver

@@ -28,6 +28,12 @@ desktop.ini
 # State files
 window_state.json
 
+# Runtime dumps & logs
+last_usage_response.json
+last_account_views.json
+logs/
+cb_consumer.json
+
 # Proxy config
 proxy.json
 

@@ -38,9 +38,11 @@ pub async fn fetch_usage(app_dir: &Path, ctx: &SessionContext) -> Result<UsageRe
     }
     let cookie = ctx.cookie_header.clone();
     let org = ctx.last_active_org.clone();
+    let dump_path = app_dir.join("last_usage_response.json");
     with_proxy_fallback(app_dir, move |client| {
         let cookie = cookie.clone();
         let org = org.clone();
+        let dump_path = dump_path.clone();
         async move {
             let resp = apply_default_headers(
                 client.get(format!("https://claude.ai/api/organizations/{org}/usage")),
@@ -51,7 +53,16 @@ pub async fn fetch_usage(app_dir: &Path, ctx: &SessionContext) -> Result<UsageRe
             .map_err(ApiError::Transport)?;
             let s = resp.status();
             match s.as_u16() {
-                200 => Ok(resp.json::<UsageResponse>().await.map_err(ApiError::Transport)?),
+                200 => {
+                    // Read body as text first so we can dump it for diagnosis,
+                    // then deserialize. The dump is invaluable when fields like
+                    // `seven_day` start coming back null/missing for some accounts.
+                    let body = resp.text().await.map_err(ApiError::Transport)?;
+                    let _ = std::fs::write(&dump_path, &body);
+                    let parsed: UsageResponse = serde_json::from_str(&body)
+                        .map_err(|e| ApiError::Http(0, format!("usage parse error: {e} body={body}")))?;
+                    Ok(parsed)
+                }
                 401 | 403 => Err(ApiError::SessionExpired(s.as_u16()).into()),
                 451 => Err(ApiError::RegionBlocked.into()),
                 code => {
