@@ -15,7 +15,7 @@ name = "ClaudeMonitor"
 path = "src/main.rs"
 
 [dependencies]
-slint = { version = "1.9", features = ["raw-window-handle-06"] }
+slint = { version = "1.9", features = ["raw-window-handle-06", "backend-winit", "renderer-skia"] }
 raw-window-handle = "0.6"
 # Pure-Rust HTTP client (rustls). Verified 2026-04-29: claude.ai accepts
 # plain rustls TLS — no Chrome fingerprinting needed (see examples/tls_probe.rs).
