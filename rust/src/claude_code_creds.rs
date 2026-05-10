@@ -4,11 +4,14 @@
 //! When the user switches the active claude.ai account in our overlay we mirror
 //! their cc_tokens into `.credentials.json` so the CLI uses the same identity.
 
-use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
+use crate::account_manager::AccountManager;
 use crate::types::CcTokens;
 
 /// File schema. Claude Code stores tokens under a `claudeAiOauth` key.
@@ -57,21 +60,77 @@ pub fn write(tokens: &CcTokens) -> Result<()> {
 
 /// Apply the active account's tokens (if any) to `.credentials.json`.
 /// Called from the account-switch handler.
-pub fn sync_active_account(am: &crate::account_manager::AccountManager) -> Result<()> {
+///
+/// We deliberately overwrite `expiresAt` with `1` so that the running `claude`
+/// CLI treats the token as expired on its next request and exchanges the
+/// refreshToken — which now belongs to the *new* account — for a fresh access
+/// token. The CLI then writes those fresh tokens back to `.credentials.json`,
+/// and our `watch_loop` captures them into `accounts_meta.json` so we don't
+/// drift over time. Net effect: switching accounts in the UI surfaces in any
+/// new (and most live) `claude` sessions without requiring `/login`.
+pub fn sync_active_account(am: &AccountManager) -> Result<()> {
     let aid = match am.active_id() {
         Some(a) => a,
         None => return Ok(()),
     };
-    if let Some(tok) = am.cc_tokens(&aid) {
+    if let Some(mut tok) = am.cc_tokens(&aid) {
+        tok.expires_at = 1;
         write(&tok)?;
-        tracing::info!(account = %aid, "wrote claude-code tokens for active account");
+        tracing::info!(account = %aid, "wrote claude-code tokens (force-refresh) for active account");
     }
     Ok(())
 }
 
+/// Periodically poll `.credentials.json` and capture any fresh tokens written
+/// by the CLI (e.g. after its automatic refresh, or after the user does
+/// `/login` directly). Updates the active account's `cc_tokens` in
+/// `accounts_meta.json` so our stored refreshToken stays valid for future
+/// switches.
+pub async fn watch_loop(am: Arc<AccountManager>, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_seen_token = String::new();
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let disk = match read() {
+                    Ok(Some(t)) => t,
+                    _ => continue,
+                };
+                if disk.access_token.is_empty() || disk.access_token == last_seen_token {
+                    continue;
+                }
+                last_seen_token = disk.access_token.clone();
+
+                let active = match am.active_id() {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let stored = am.cc_tokens(&active);
+                let differs = stored
+                    .as_ref()
+                    .map_or(true, |s| s.access_token != disk.access_token);
+                // Skip the special force-refresh marker we just wrote — the
+                // CLI hasn't refreshed yet, so the disk token is still ours.
+                if differs && disk.expires_at != 1 {
+                    if let Err(e) = am.update_cc_tokens(&active, disk) {
+                        tracing::warn!(error = %e, "update_cc_tokens failed");
+                    } else {
+                        tracing::info!(account = %active, "captured refreshed CC tokens from .credentials.json");
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
+}
+
 /// On startup: if `accounts_meta.json` doesn't have cc_tokens for the active
 /// account but `.credentials.json` does — backfill them.
-pub fn backfill_from_disk(am: &crate::account_manager::AccountManager) -> Result<()> {
+pub fn backfill_from_disk(am: &AccountManager) -> Result<()> {
     let aid = match am.active_id() {
         Some(a) => a,
         None => return Ok(()),

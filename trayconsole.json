@@ -12,6 +12,7 @@
         "stop": null,
         "build": null
       },
+      "autoRestart": true,
       "pipe": "trayconsole_claude_monitor",
       "window": true,
       "customActions": [

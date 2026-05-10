@@ -19,6 +19,14 @@ chrome_profile/
 claude_auth.json
 accounts/
 accounts_meta.json
+**/.cb_state/
+
+# Rust
+rust/target/
+
+# Go
+*.test
+*.out
 
 # Windows
 *.lnk

@@ -110,6 +110,11 @@ fn main() -> Result<()> {
             handle_cookie_events(cookie_rx, am, app_dir, ui_weak, usage_cache).await;
         });
     }
+    {
+        let am = am.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        rt_handle.spawn(claude_code_creds::watch_loop(am, shutdown_rx));
+    }
     if !bridge_disabled {
         rt_handle.spawn({
             let tx = cookie_tx.clone();
