@@ -4,9 +4,9 @@
 //! Routes:
 //!   GET  /health    → {"ok":true,"app":"ClaudeMonitor"}
 //!   POST /cookies   → Hub-signed push body, HMAC-SHA256 over canonical:
-//!                         <ts>\n<nonce>\nPOST\n/cookies\n<body bytes>
+//!                         <ts>\n<body bytes>   (matches hub internal/hmac/hmac.go `Sign`)
 //!                     Headers required:
-//!                         X-CB-Timestamp, X-CB-Nonce, X-CB-Signature: sha256=<hex>
+//!                         X-CB-Timestamp, X-CB-Signature: sha256=<hex>
 //!                     Accepted body shapes (any of):
 //!                         {"snapshots":[{"cookies":[…],"domain":".claude.ai", …}, …]}
 //!                         {"snapshot":{"cookies":[…], …}}
@@ -265,7 +265,7 @@ fn cors(mut resp: axum::response::Response) -> axum::response::Response {
     h.insert(
         "Access-Control-Allow-Headers",
         HeaderValue::from_static(
-            "Content-Type, X-CB-Timestamp, X-CB-Nonce, X-CB-Signature",
+            "Content-Type, X-CB-Timestamp, X-CB-Signature",
         ),
     );
     resp
