@@ -198,13 +198,12 @@ async fn post_cookies(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let ts    = headers.get("x-cb-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let nonce = headers.get("x-cb-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let sig   = headers.get("x-cb-signature").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ts  = headers.get("x-cb-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let sig = headers.get("x-cb-signature").and_then(|v| v.to_str().ok()).unwrap_or("");
 
-    if !verify_hmac(&s.secret, ts, nonce, "POST", "/cookies", &body, sig) {
+    if !verify_hmac(&s.secret, ts, &body, sig) {
         tracing::warn!(
-            ts, nonce_len = nonce.len(), sig_prefix = &sig[..sig.len().min(14)],
+            ts, sig_prefix = &sig[..sig.len().min(14)],
             "CookieBridge push REJECTED — bad HMAC"
         );
         let mut resp = StatusCode::UNAUTHORIZED.into_response();
@@ -274,19 +273,18 @@ fn cors(mut resp: axum::response::Response) -> axum::response::Response {
 
 // ───────────────────────────── HMAC verification ────────────────────────────
 
-fn verify_hmac(
-    secret: &str,
-    ts: &str,
-    nonce: &str,
-    method: &str,
-    path: &str,
-    body: &[u8],
-    signature: &str,
-) -> bool {
-    if !signature.to_ascii_lowercase().starts_with("sha256=") {
-        return false;
-    }
-    let provided = match hex::decode(&signature["sha256=".len()..]) {
+fn verify_hmac(secret: &str, ts: &str, body: &[u8], signature: &str) -> bool {
+    // Must match the Hub's push signing EXACTLY (hub/internal/hmac/hmac.go `Sign`):
+    //   HMAC-SHA256(secret, "<ts>\n" + body),  header value "sha256=<hex>".
+    // The Hub's push sends only X-CB-Signature + X-CB-Timestamp — no nonce and no
+    // method/path. The previous canonical here (ts\nnonce\nPOST\n/cookies\nbody +
+    // a mandatory nonce) never matched, so every cookie push was rejected with 401
+    // and cookies never refreshed.
+    let hex_sig = match signature.strip_prefix("sha256=") {
+        Some(h) => h,
+        None => return false,
+    };
+    let provided = match hex::decode(hex_sig) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -301,21 +299,12 @@ fn verify_hmac(
     if (now - ts_int).abs() > TS_TOLERANCE_SEC {
         return false;
     }
-    if nonce.len() < 8 {
-        return false;
-    }
 
     let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
         Ok(m) => m,
         Err(_) => return false,
     };
     mac.update(ts.as_bytes());
-    mac.update(b"\n");
-    mac.update(nonce.as_bytes());
-    mac.update(b"\n");
-    mac.update(method.as_bytes());
-    mac.update(b"\n");
-    mac.update(path.as_bytes());
     mac.update(b"\n");
     mac.update(body);
 
@@ -487,15 +476,9 @@ async fn kill_process_on_port() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn sign(secret: &str, ts: &str, nonce: &str, method: &str, path: &str, body: &[u8]) -> String {
+    fn sign(secret: &str, ts: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(ts.as_bytes());
-        mac.update(b"\n");
-        mac.update(nonce.as_bytes());
-        mac.update(b"\n");
-        mac.update(method.as_bytes());
-        mac.update(b"\n");
-        mac.update(path.as_bytes());
         mac.update(b"\n");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
@@ -509,10 +492,9 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string();
-        let nonce = "this-is-a-long-nonce";
-        let body = br#"{"snapshots":[]}"#;
-        let sig = sign(secret, &now, nonce, "POST", "/cookies", body);
-        assert!(verify_hmac(secret, &now, nonce, "POST", "/cookies", body, &sig));
+        let body = br#"{"cookies":[]}"#;
+        let sig = sign(secret, &now, body);
+        assert!(verify_hmac(secret, &now, body, &sig));
     }
 
     #[test]
@@ -523,34 +505,32 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string();
-        let nonce = "this-is-a-long-nonce";
-        let body = br#"{"snapshots":[]}"#;
-        let sig = sign(secret, &now, nonce, "POST", "/cookies", body);
-        let tampered = br#"{"snapshots":[{}]}"#;
-        assert!(!verify_hmac(secret, &now, nonce, "POST", "/cookies", tampered, &sig));
+        let body = br#"{"cookies":[]}"#;
+        let sig = sign(secret, &now, body);
+        let tampered = br#"{"cookies":[{}]}"#;
+        assert!(!verify_hmac(secret, &now, tampered, &sig));
     }
 
     #[test]
     fn verify_hmac_rejects_stale_timestamp() {
         let secret = "test-secret-abc";
         let stale = "100"; // way in the past
-        let nonce = "this-is-a-long-nonce";
         let body = b"";
-        let sig = sign(secret, stale, nonce, "POST", "/cookies", body);
-        assert!(!verify_hmac(secret, stale, nonce, "POST", "/cookies", body, &sig));
+        let sig = sign(secret, stale, body);
+        assert!(!verify_hmac(secret, stale, body, &sig));
     }
 
     #[test]
-    fn verify_hmac_rejects_short_nonce() {
+    fn verify_hmac_rejects_wrong_secret() {
         let secret = "test-secret-abc";
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             .to_string();
-        let body = b"";
-        let sig = sign(secret, &now, "abc", "POST", "/cookies", body);
-        assert!(!verify_hmac(secret, &now, "abc", "POST", "/cookies", body, &sig));
+        let body = b"payload";
+        let sig = sign(secret, &now, body);
+        assert!(!verify_hmac("different-secret", &now, body, &sig));
     }
 
     #[tokio::test]
