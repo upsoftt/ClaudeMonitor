@@ -97,7 +97,13 @@ struct ReceiverSpec<'a> {
 
 #[derive(Deserialize)]
 struct RegisterResponse {
+    // The Hub returns `consumerId` / `consumerSecret` (see hub
+    // handlers_consumer.go). Without these renames serde leaves both `None`,
+    // so registration "succeeds" but we never persist the secret → no
+    // cb_consumer.json → re-register → 409 loop, and cookie pushes never work.
+    #[serde(rename = "consumerId")]
     id: Option<String>,
+    #[serde(rename = "consumerSecret")]
     secret: Option<String>,
 }
 

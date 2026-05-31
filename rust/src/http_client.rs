@@ -98,26 +98,42 @@ where
     F: Fn(reqwest::Client) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let direct_err: anyhow::Error = match op(make_client(None)?).await {
+    // Decide direct-vs-proxy up front via a short (5s) probe, cached for 10 min
+    // (`effective_proxy_url`). This is the critical fix for the "таймаут fetch"
+    // freeze: the old code tried a *direct* request first with the full 15s
+    // client timeout, but the caller (`fetch_one`) wraps the whole op in a 15s
+    // `timeout(..)`. When direct access is blocked (claude.ai reachable only via
+    // the proxy) the direct attempt ate the entire budget and the outer timeout
+    // fired *before* the proxy retry ran — so this fallback was dead code. By
+    // probing first, a blocked direct path costs 5s once, then every request
+    // goes straight through the proxy (~0.5s), comfortably inside the 15s budget.
+    let chosen = crate::proxy::effective_proxy_url(app_dir).await;
+    let proxy_opt = if chosen.is_empty() { None } else { Some(chosen.as_str()) };
+
+    let err: anyhow::Error = match op(make_client(proxy_opt)?).await {
         Ok(v) => return Ok(v),
         Err(e) => e,
     };
 
-    // Don't retry through proxy on session-class errors — caller already
-    // wraps them in `ApiError::SessionExpired`. We only retry transport-class
-    // errors (timeouts, DNS, connection refused, region-block 451).
-    if let Some(api_err) = direct_err.downcast_ref::<ApiError>() {
+    // Don't retry on session-class errors — a proxy can't fix bad cookies.
+    if let Some(api_err) = err.downcast_ref::<ApiError>() {
         if api_err.is_auth_failure() {
-            return Err(direct_err);
+            return Err(err);
         }
     }
 
-    let proxy = crate::proxy::load_proxy_url(app_dir);
-    if proxy.is_empty() {
-        return Err(direct_err);
+    // If the probe sent us direct and direct then failed with a transport error,
+    // fall back to the configured proxy once and force a re-probe next time
+    // (our cached "direct works" decision was wrong or went stale).
+    if chosen.is_empty() {
+        let proxy = crate::proxy::load_proxy_url(app_dir);
+        if !proxy.is_empty() {
+            crate::proxy::invalidate_cache();
+            tracing::warn!(err = %err, proxy = %proxy, "direct failed, retrying via proxy");
+            return op(make_client(Some(&proxy))?).await;
+        }
     }
-    tracing::warn!(direct_err = %direct_err, proxy = %proxy, "direct failed, retrying via proxy");
-    op(make_client(Some(&proxy))?).await
+    Err(err)
 }
 
 #[derive(Debug, thiserror::Error)]

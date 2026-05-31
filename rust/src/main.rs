@@ -120,8 +120,22 @@ fn main() -> Result<()> {
             let tx = cookie_tx.clone();
             let app_dir = app_dir.clone();
             async move {
-                if let Err(e) = cookie_bridge::run(tx, app_dir).await {
-                    tracing::error!(error = %e, "cookie_bridge fatal");
+                // Retry with backoff: at login the Hub (and xray) may not be up
+                // yet, and `cookie_bridge::run` registers with the Hub on startup.
+                // A single failed attempt previously left us unregistered for the
+                // whole session (no `cb_consumer.json`, no cookie pushes → cookies
+                // went stale after every reboot). Keep trying until it sticks.
+                let mut delay = Duration::from_secs(2);
+                loop {
+                    match cookie_bridge::run(tx.clone(), app_dir.clone()).await {
+                        Ok(()) => break, // graceful shutdown
+                        Err(e) => {
+                            tracing::error!(error = %e, delay_secs = delay.as_secs(),
+                                "cookie_bridge failed, retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(Duration::from_secs(60));
+                        }
+                    }
                 }
             }
         });
@@ -776,14 +790,22 @@ async fn periodic_fetcher(
     mut refresh_rx: mpsc::Receiver<RefreshKind>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
-    let mut last_active_fetch = Instant::now() - Duration::from_secs(FETCH_INTERVAL_SECS);
-    let mut last_all_fetch = Instant::now() - Duration::from_secs(PER_ACCOUNT_FETCH_INTERVAL_SECS);
+    // `None` = "never fetched yet, due immediately". Using a sentinel instead of
+    // `Instant::now() - interval` avoids a panic on Windows when the machine was
+    // just booted: `Instant` is monotonic from boot, so subtracting an interval
+    // larger than the current uptime overflows ("overflow when subtracting
+    // duration from instant"). We autostart at login, so uptime is frequently
+    // below the 180s interval — which crashed this loop on every reboot.
+    let mut last_active_fetch: Option<Instant> = None;
+    let mut last_all_fetch: Option<Instant> = None;
 
     loop {
         if *shutdown.borrow() { break; }
 
-        let active_due = last_active_fetch.elapsed() >= Duration::from_secs(FETCH_INTERVAL_SECS);
-        let all_due = last_all_fetch.elapsed() >= Duration::from_secs(PER_ACCOUNT_FETCH_INTERVAL_SECS);
+        let active_due = last_active_fetch
+            .map_or(true, |t| t.elapsed() >= Duration::from_secs(FETCH_INTERVAL_SECS));
+        let all_due = last_all_fetch
+            .map_or(true, |t| t.elapsed() >= Duration::from_secs(PER_ACCOUNT_FETCH_INTERVAL_SECS));
 
         let mut requested: Option<RefreshKind> = None;
         if !active_due && !all_due {
@@ -808,7 +830,7 @@ async fn periodic_fetcher(
             .then(|| RefreshGuard::new(ui_weak.clone()));
 
         if do_active && !active_id.is_empty() {
-            last_active_fetch = Instant::now();
+            last_active_fetch = Some(Instant::now());
             fetch_one(&am, &app_dir, &active_id, &usage_cache, &ui_weak).await;
             // Update tray icons from active account's usage.
             let tray_clone = tray.lock().clone();
@@ -829,7 +851,7 @@ async fn periodic_fetcher(
             }
         }
         if do_all {
-            last_all_fetch = Instant::now();
+            last_all_fetch = Some(Instant::now());
             for acc in am.all() {
                 if acc.id == active_id { continue; } // already done above
                 fetch_one(&am, &app_dir, &acc.id, &usage_cache, &ui_weak).await;

@@ -14,4 +14,7 @@ set SLINT_BACKEND=winit-skia
 
 REM Rust binary is windows_subsystem="windows" — stderr only reaches a file
 REM when redirected from this cmd.exe parent.
-ClaudeMonitor.exe 2>> logs\rust.stderr.log
+REM Use the fully-qualified path (%~dp0 = this script's dir): under TrayConsole's
+REM restart environment cmd does not search the current directory for a bare
+REM `ClaudeMonitor.exe`, so it failed with "is not recognized as a command".
+"%~dp0ClaudeMonitor.exe" 2>> logs\rust.stderr.log
