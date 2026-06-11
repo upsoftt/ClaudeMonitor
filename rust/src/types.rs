@@ -21,6 +21,10 @@ pub struct AccountsMeta {
     /// orgs are silently ignored.
     #[serde(default)]
     pub removed_orgs: Vec<String>,
+
+    /// Row selected for the two tray icons: "codex" or "claude:<account_id>".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tray_source: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -177,6 +181,8 @@ pub struct UsageResponse {
     #[serde(default)]
     pub seven_day_omelette: Option<MetricBucket>,
     #[serde(default)]
+    pub omelette_promotional: Option<MetricBucket>,
+    #[serde(default)]
     pub seven_day_opus: Option<MetricBucket>,
     #[serde(default)]
     pub seven_day_sonnet: Option<MetricBucket>,
@@ -184,6 +190,26 @@ pub struct UsageResponse {
     pub seven_day_cowork: Option<MetricBucket>,
     #[serde(default)]
     pub seven_day_oauth_apps: Option<MetricBucket>,
+    #[serde(default)]
+    pub tangelo: Option<MetricBucket>,
+    #[serde(default)]
+    pub iguana_necktie: Option<MetricBucket>,
+    #[serde(default)]
+    pub cinder_cove: Option<MetricBucket>,
+}
+
+impl UsageResponse {
+    /// Visible Claude Design weekly bucket.
+    ///
+    /// The live API used `seven_day_omelette` historically. On the current
+    /// Max/Claude Code payload it is null, while the separate visible bucket
+    /// arrives as `seven_day_sonnet`.
+    pub fn claude_design_metric(&self) -> Option<&MetricBucket> {
+        self.seven_day_omelette
+            .as_ref()
+            .or(self.omelette_promotional.as_ref())
+            .or(self.seven_day_sonnet.as_ref())
+    }
 }
 
 /// Real claude.ai `/usage` payload format (verified 2026-04-29):
@@ -331,7 +357,9 @@ pub fn plan_from_org(org: &OrgInfo) -> String {
         .iter()
         .filter_map(|c| match c {
             serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => o.get("name").and_then(|v| v.as_str()).map(String::from),
+            serde_json::Value::Object(o) => {
+                o.get("name").and_then(|v| v.as_str()).map(String::from)
+            }
             _ => None,
         })
         .collect();
@@ -397,6 +425,7 @@ mod tests {
                 ..Default::default()
             }],
             removed_orgs: vec![],
+            tray_source: None,
         };
         let s = serde_json::to_string(&meta).unwrap();
         // pending=false and cc_tokens=None should be skipped
@@ -410,7 +439,10 @@ mod tests {
         let json = r#"{"utilization": 85.0, "resets_at": "2026-04-29T15:10:01.248484+00:00"}"#;
         let m: MetricBucket = serde_json::from_str(json).unwrap();
         assert!((m.percent() - 85.0).abs() < 1e-6);
-        assert_eq!(m.resets_at.as_deref(), Some("2026-04-29T15:10:01.248484+00:00"));
+        assert_eq!(
+            m.resets_at.as_deref(),
+            Some("2026-04-29T15:10:01.248484+00:00")
+        );
     }
 
     #[test]
@@ -428,6 +460,24 @@ mod tests {
     }
 
     #[test]
+    fn claude_design_metric_falls_back_to_current_api_field() {
+        let json = r#"{
+            "seven_day_omelette": null,
+            "seven_day_sonnet": {
+                "utilization": 42.5,
+                "resets_at": "2026-06-10T01:00:00.197400+00:00"
+            }
+        }"#;
+        let usage: UsageResponse = serde_json::from_str(json).unwrap();
+        let design = usage.claude_design_metric().unwrap();
+        assert!((design.percent() - 42.5).abs() < 1e-6);
+        assert_eq!(
+            design.resets_at.as_deref(),
+            Some("2026-06-10T01:00:00.197400+00:00")
+        );
+    }
+
+    #[test]
     fn plan_from_max20x_tier() {
         let mut o = OrgInfo::default();
         o.rate_limit_tier = Some("default_claude_max_20x".into());
@@ -442,9 +492,21 @@ mod tests {
     #[test]
     fn cookie_helpers() {
         let cookies = vec![
-            Cookie { name: "sessionKey".into(), value: "sk-x".into(), ..Default::default() },
-            Cookie { name: "lastActiveOrg".into(), value: "abc".into(), ..Default::default() },
-            Cookie { name: "noise".into(), value: "n".into(), ..Default::default() },
+            Cookie {
+                name: "sessionKey".into(),
+                value: "sk-x".into(),
+                ..Default::default()
+            },
+            Cookie {
+                name: "lastActiveOrg".into(),
+                value: "abc".into(),
+                ..Default::default()
+            },
+            Cookie {
+                name: "noise".into(),
+                value: "n".into(),
+                ..Default::default()
+            },
         ];
         assert_eq!(session_key(&cookies), Some("sk-x"));
         assert_eq!(last_active_org(&cookies), Some("abc"));

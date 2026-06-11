@@ -59,8 +59,9 @@ pub async fn fetch_usage(app_dir: &Path, ctx: &SessionContext) -> Result<UsageRe
                     // `seven_day` start coming back null/missing for some accounts.
                     let body = resp.text().await.map_err(ApiError::Transport)?;
                     let _ = std::fs::write(&dump_path, &body);
-                    let parsed: UsageResponse = serde_json::from_str(&body)
-                        .map_err(|e| ApiError::Http(0, format!("usage parse error: {e} body={body}")))?;
+                    let parsed: UsageResponse = serde_json::from_str(&body).map_err(|e| {
+                        ApiError::Http(0, format!("usage parse error: {e} body={body}"))
+                    })?;
                     Ok(parsed)
                 }
                 401 | 403 => Err(ApiError::SessionExpired(s.as_u16()).into()),
@@ -85,13 +86,10 @@ pub async fn fetch_identity(app_dir: &Path, ctx: &SessionContext) -> Result<Iden
         let cookie = cookie.clone();
         async move {
             // /api/account
-            let resp = apply_default_headers(
-                client.get("https://claude.ai/api/account"),
-                &cookie,
-            )
-            .send()
-            .await
-            .map_err(ApiError::Transport)?;
+            let resp = apply_default_headers(client.get("https://claude.ai/api/account"), &cookie)
+                .send()
+                .await
+                .map_err(ApiError::Transport)?;
             let acc: AccountInfo = match resp.status().as_u16() {
                 200 => resp.json().await.map_err(ApiError::Transport)?,
                 401 | 403 => return Err(ApiError::SessionExpired(resp.status().as_u16()).into()),
@@ -101,17 +99,18 @@ pub async fn fetch_identity(app_dir: &Path, ctx: &SessionContext) -> Result<Iden
                 }
             };
             // /api/organizations — pick first user-billable org.
-            let resp2 = apply_default_headers(
-                client.get("https://claude.ai/api/organizations"),
-                &cookie,
-            )
-            .send()
-            .await
-            .map_err(ApiError::Transport)?;
+            let resp2 =
+                apply_default_headers(client.get("https://claude.ai/api/organizations"), &cookie)
+                    .send()
+                    .await
+                    .map_err(ApiError::Transport)?;
             let mut plan = String::new();
             if resp2.status().as_u16() == 200 {
                 let orgs: Vec<OrgInfo> = resp2.json().await.map_err(ApiError::Transport)?;
-                let chosen = orgs.iter().find(|o| o.billing_type.is_some()).or_else(|| orgs.first());
+                let chosen = orgs
+                    .iter()
+                    .find(|o| o.billing_type.is_some())
+                    .or_else(|| orgs.first());
                 if let Some(o) = chosen {
                     plan = plan_from_org(o);
                 }

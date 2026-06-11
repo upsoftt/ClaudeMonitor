@@ -198,12 +198,19 @@ async fn post_cookies(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let ts  = headers.get("x-cb-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let sig = headers.get("x-cb-signature").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ts = headers
+        .get("x-cb-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let sig = headers
+        .get("x-cb-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
     if !verify_hmac(&s.secret, ts, &body, sig) {
         tracing::warn!(
-            ts, sig_prefix = &sig[..sig.len().min(14)],
+            ts,
+            sig_prefix = &sig[..sig.len().min(14)],
             "CookieBridge push REJECTED — bad HMAC"
         );
         let mut resp = StatusCode::UNAUTHORIZED.into_response();
@@ -224,7 +231,11 @@ async fn post_cookies(
     let snapshots = match payload {
         PushBody::Snapshots { snapshots } => snapshots,
         PushBody::OneSnapshot { snapshot } => vec![snapshot],
-        PushBody::Bare { cookies, profile_label, event } => vec![SnapshotEntry {
+        PushBody::Bare {
+            cookies,
+            profile_label,
+            event,
+        } => vec![SnapshotEntry {
             cookies,
             profile_label,
             domain: String::new(),
@@ -240,9 +251,8 @@ async fn post_cookies(
         if snap.cookies.is_empty() {
             continue;
         }
-        let _ = s
-            .tx
-            .send(CookieEvent {
+        let _ =
+            s.tx.send(CookieEvent {
                 profile_label: snap.profile_label,
                 event: snap.event,
                 cookies: snap.cookies,
@@ -264,9 +274,7 @@ fn cors(mut resp: axum::response::Response) -> axum::response::Response {
     );
     h.insert(
         "Access-Control-Allow-Headers",
-        HeaderValue::from_static(
-            "Content-Type, X-CB-Timestamp, X-CB-Signature",
-        ),
+        HeaderValue::from_static("Content-Type, X-CB-Timestamp, X-CB-Signature"),
     );
     resp
 }
@@ -392,7 +400,10 @@ async fn capture_port() -> Result<()> {
     if !is_port_busy() {
         return Ok(());
     }
-    tracing::warn!(port = BRIDGE_PORT, "port busy — asking old instance to shut down");
+    tracing::warn!(
+        port = BRIDGE_PORT,
+        "port busy — asking old instance to shut down"
+    );
     if let Err(e) = ask_remote_shutdown().await {
         tracing::warn!(error = %e, "remote /shutdown failed");
     }
@@ -415,7 +426,9 @@ async fn capture_port() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    anyhow::bail!("port {BRIDGE_PORT} still busy after kill — refusing to start on a different port");
+    anyhow::bail!(
+        "port {BRIDGE_PORT} still busy after kill — refusing to start on a different port"
+    );
 }
 
 fn is_port_busy() -> bool {
@@ -564,7 +577,11 @@ mod tests {
         });
         let parsed: PushBody = serde_json::from_value(body).unwrap();
         match parsed {
-            PushBody::Bare { cookies, profile_label, .. } => {
+            PushBody::Bare {
+                cookies,
+                profile_label,
+                ..
+            } => {
                 assert_eq!(cookies.len(), 1);
                 assert_eq!(profile_label, "Default");
             }

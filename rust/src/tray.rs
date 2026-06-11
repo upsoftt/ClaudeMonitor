@@ -18,11 +18,11 @@ const ICON_SIZE: u32 = 64;
 /// Color for a percent value: green < 70, yellow < 90, red ≥ 90.
 fn color_for(pct: f64) -> Rgba<u8> {
     if pct < 70.0 {
-        Rgba([0x4a, 0xde, 0x80, 0xff])      // #4ade80
+        Rgba([0x4a, 0xde, 0x80, 0xff]) // #4ade80
     } else if pct < 90.0 {
-        Rgba([0xfa, 0xcc, 0x15, 0xff])      // #facc15
+        Rgba([0xfa, 0xcc, 0x15, 0xff]) // #facc15
     } else {
-        Rgba([0xf8, 0x71, 0x71, 0xff])      // #f87171
+        Rgba([0xf8, 0x71, 0x71, 0xff]) // #f87171
     }
 }
 
@@ -32,8 +32,8 @@ pub const WEEKLY_COLOR: Rgba<u8> = Rgba([0x22, 0xd3, 0xee, 0xff]); // #22d3ee
 /// System font cache. Tries Arial Bold → Segoe UI Bold → Arial. None → bitmap fallback.
 static SYS_BOLD_FONT: Lazy<Option<Font>> = Lazy::new(|| {
     let candidates = [
-        r"C:\Windows\Fonts\arialbd.ttf",   // Arial Bold (matches Python QFont)
-        r"C:\Windows\Fonts\segoeuib.ttf",  // Segoe UI Bold
+        r"C:\Windows\Fonts\arialbd.ttf",  // Arial Bold (matches Python QFont)
+        r"C:\Windows\Fonts\segoeuib.ttf", // Segoe UI Bold
         r"C:\Windows\Fonts\arial.ttf",
     ];
     for path in candidates {
@@ -53,7 +53,10 @@ pub fn render_pct_icon(pct: Option<f64>, override_color: Option<Rgba<u8>>) -> Rg
     draw_rounded_rect(&mut img, Rgba([0, 0, 0, 0xff]), 4);
 
     let (text, color) = match pct {
-        None => ("C".to_string(), override_color.unwrap_or(Rgba([0x4a, 0xde, 0x80, 0xff]))),
+        None => (
+            "C".to_string(),
+            override_color.unwrap_or(Rgba([0x4a, 0xde, 0x80, 0xff])),
+        ),
         Some(p) => {
             let display = format!("{:.0}", p);
             (display, override_color.unwrap_or_else(|| color_for(p)))
@@ -70,7 +73,11 @@ pub fn render_pct_icon(pct: Option<f64>, override_color: Option<Rgba<u8>>) -> Rg
 /// Render text via fontdue at a centered baseline. Composites alpha into RGBA.
 fn draw_text_ttf(img: &mut RgbaImage, font: &Font, text: &str, color: Rgba<u8>) {
     // Mirror Python: 38pt for ≤2 digits, 28pt for 3. Pixel-size approx = pt * 96/72.
-    let px_size: f32 = if text.chars().count() <= 2 { 50.0 } else { 38.0 };
+    let px_size: f32 = if text.chars().count() <= 2 {
+        50.0
+    } else {
+        38.0
+    };
 
     // First pass: total advance width and max ascent/descent.
     let metrics: Vec<_> = text.chars().map(|c| font.metrics(c, px_size)).collect();
@@ -82,7 +89,10 @@ fn draw_text_ttf(img: &mut RgbaImage, font: &Font, text: &str, color: Rgba<u8>) 
 
     let start_x = ((ICON_SIZE as f32 - total_w) / 2.0).max(0.0);
     // Vertically center the bounding box of the rendered glyphs.
-    let max_h: f32 = metrics.iter().map(|m| m.height as f32).fold(0.0_f32, f32::max);
+    let max_h: f32 = metrics
+        .iter()
+        .map(|m| m.height as f32)
+        .fold(0.0_f32, f32::max);
     let baseline_y = (ICON_SIZE as f32 - max_h) / 2.0 + max_ascent;
 
     let [r, g, b, _a] = color.0;
@@ -138,8 +148,8 @@ pub fn build_icon_with_color(pct: Option<f64>, override_color: Option<Rgba<u8>>)
 /// (must stay alive for the lifetime of the app) and the IDs of the
 /// hand-crafted menu items so callers can match `MenuEvent`s.
 pub struct TrayHandle {
-    pub session: TrayIcon,                        // 5h session icon (traffic-light)
-    pub weekly: TrayIcon,                         // 7d weekly icon (always cyan)
+    pub session: TrayIcon, // 5h session icon (traffic-light)
+    pub weekly: TrayIcon,  // 7d weekly icon (always cyan)
     pub show_id: tray_icon::menu::MenuId,
     pub add_id: tray_icon::menu::MenuId,
     pub quit_id: tray_icon::menu::MenuId,
@@ -200,11 +210,7 @@ fn clone_menu(
 /// Update the session tray icon and tooltip.
 /// `reset_text` is the pre-formatted "Xч Yм" / "Xд Yч" string from
 /// `format_remaining`; empty means "no reset data available".
-pub fn update_session(
-    handle: &TrayHandle,
-    pct: Option<f64>,
-    reset_text: &str,
-) -> Result<()> {
+pub fn update_session(handle: &TrayHandle, pct: Option<f64>, reset_text: &str) -> Result<()> {
     handle.session.set_icon(Some(build_icon(pct)?))?;
     let tip = if reset_text.is_empty() {
         "5-часовая сессия".to_string()
@@ -216,11 +222,7 @@ pub fn update_session(
 }
 
 /// Update the weekly tray icon (always cyan) and tooltip.
-pub fn update_weekly(
-    handle: &TrayHandle,
-    pct: Option<f64>,
-    reset_text: &str,
-) -> Result<()> {
+pub fn update_weekly(handle: &TrayHandle, pct: Option<f64>, reset_text: &str) -> Result<()> {
     handle
         .weekly
         .set_icon(Some(build_icon_with_color(pct, Some(WEEKLY_COLOR))?))?;
@@ -284,17 +286,39 @@ fn corner_outside(x: i32, y: i32, r: i32, w: i32, h: i32) -> bool {
 // Lifted from a public-domain bitmap font, hand-tuned for legibility at this size.
 fn glyph_for(c: char) -> Option<[u8; 7]> {
     match c {
-        '0' => Some([0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110]),
-        '1' => Some([0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
-        '2' => Some([0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]),
-        '3' => Some([0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110]),
-        '4' => Some([0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]),
-        '5' => Some([0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110]),
-        '6' => Some([0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]),
-        '7' => Some([0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000]),
-        '8' => Some([0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110]),
-        '9' => Some([0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100]),
-        'C' => Some([0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110]),
+        '0' => Some([
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ]),
+        '1' => Some([
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ]),
+        '2' => Some([
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ]),
+        '3' => Some([
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ]),
+        '4' => Some([
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ]),
+        '5' => Some([
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ]),
+        '6' => Some([
+            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ]),
+        '7' => Some([
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ]),
+        '8' => Some([
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ]),
+        '9' => Some([
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+        ]),
+        'C' => Some([
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ]),
         _ => None,
     }
 }

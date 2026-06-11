@@ -39,6 +39,7 @@ window_state.json
 # Runtime dumps & logs
 last_usage_response.json
 last_account_views.json
+last_codex_usage.json
 logs/
 cb_consumer.json
 

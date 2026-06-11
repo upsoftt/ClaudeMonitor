@@ -88,10 +88,7 @@ pub async fn run(
 }
 
 #[cfg(windows)]
-async fn connect_and_serve(
-    pipe_path: &str,
-    tx: &mpsc::Sender<TrayCommand>,
-) -> Result<()> {
+async fn connect_and_serve(pipe_path: &str, tx: &mpsc::Sender<TrayCommand>) -> Result<()> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let pipe = ClientOptions::new()
@@ -230,9 +227,18 @@ mod tests {
 
     #[test]
     fn parses_known_commands() {
-        assert!(matches!(TrayCommand::from_wire("shutdown"), TrayCommand::Stop));
-        assert!(matches!(TrayCommand::from_wire("custom:show"), TrayCommand::Show));
-        assert!(matches!(TrayCommand::from_wire("custom:refresh"), TrayCommand::Refresh));
+        assert!(matches!(
+            TrayCommand::from_wire("shutdown"),
+            TrayCommand::Stop
+        ));
+        assert!(matches!(
+            TrayCommand::from_wire("custom:show"),
+            TrayCommand::Show
+        ));
+        assert!(matches!(
+            TrayCommand::from_wire("custom:refresh"),
+            TrayCommand::Refresh
+        ));
         match TrayCommand::from_wire("custom:weird") {
             TrayCommand::Custom(s) => assert_eq!(s, "custom:weird"),
             _ => panic!("expected custom"),

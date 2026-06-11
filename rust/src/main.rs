@@ -16,10 +16,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use claude_monitor::{
     account_manager::AccountManager,
-    api, claude_code_creds,
+    api, claude_code_creds, codex_usage,
     cookie_bridge::{self, CookieEvent},
-    http_client, paths, proxy,
-    tray as tray_mod,
+    http_client, paths, proxy, tray as tray_mod,
     trayconsole::{self, TrayCommand},
     types::{Cookie, MetricBucket, UsageResponse},
 };
@@ -58,9 +57,12 @@ const PER_ACCOUNT_FETCH_INTERVAL_SECS: u64 = 60;
 const INCIDENTS_INTERVAL_SECS: u64 = 120;
 const TICK_INTERVAL_MS: u64 = 1000;
 const TRAYCONSOLE_PIPE: &str = "trayconsole_claude_monitor";
+const CODEX_TRAY_SOURCE: &str = "codex";
+const CLAUDE_TRAY_PREFIX: &str = "claude:";
 
 /// Per-account cached usage so the UI can rebuild rows from a single source.
 type UsageCache = Arc<AsyncMutex<HashMap<String, UsageResponse>>>;
+type CodexUsageCache = Arc<AsyncMutex<Option<codex_usage::CodexUsageSnapshot>>>;
 
 fn main() -> Result<()> {
     init_tracing();
@@ -74,6 +76,7 @@ fn main() -> Result<()> {
     claude_code_creds::backfill_from_disk(&am).ok();
 
     let usage_cache: UsageCache = Arc::new(AsyncMutex::new(HashMap::new()));
+    let codex_cache: CodexUsageCache = Arc::new(AsyncMutex::new(None));
 
     // ── Tokio runtime in a dedicated thread ──────────────────────────────
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -98,7 +101,11 @@ fn main() -> Result<()> {
     // fighting over :19225 and the trayconsole_claude_monitor pipe.
     let bridge_disabled = std::env::var("CMON_DISABLE_BRIDGE").is_ok();
     let trayconsole_disabled = std::env::var("CMON_DISABLE_TRAYCONSOLE").is_ok();
-    tracing::info!(bridge_disabled, trayconsole_disabled, "side-by-side mode flags");
+    tracing::info!(
+        bridge_disabled,
+        trayconsole_disabled,
+        "side-by-side mode flags"
+    );
 
     // ── Spawn background tasks ───────────────────────────────────────────
     {
@@ -163,10 +170,42 @@ fn main() -> Result<()> {
         let app_dir = app_dir.clone();
         let ui_weak = ui_weak.clone();
         let usage_cache = usage_cache.clone();
+        let codex_cache = codex_cache.clone();
         let tray_for_fetcher = tray_for_fetcher.clone();
         let mut sd = shutdown_rx.clone();
         rt_handle.spawn(async move {
-            periodic_fetcher(am, app_dir, ui_weak, usage_cache, tray_for_fetcher, refresh_rx, &mut sd).await;
+            periodic_fetcher(
+                am,
+                app_dir,
+                ui_weak,
+                usage_cache,
+                codex_cache,
+                tray_for_fetcher,
+                refresh_rx,
+                &mut sd,
+            )
+            .await;
+        });
+    }
+    {
+        let app_dir = app_dir.clone();
+        let ui_weak = ui_weak.clone();
+        let am = am.clone();
+        let usage_cache = usage_cache.clone();
+        let codex_cache = codex_cache.clone();
+        let tray_for_fetcher = tray_for_fetcher.clone();
+        let mut sd = shutdown_rx.clone();
+        rt_handle.spawn(async move {
+            periodic_codex_fetcher(
+                app_dir,
+                ui_weak,
+                am,
+                usage_cache,
+                codex_cache,
+                tray_for_fetcher,
+                &mut sd,
+            )
+            .await;
         });
     }
     {
@@ -188,18 +227,24 @@ fn main() -> Result<()> {
         let ui_weak = ui_weak.clone();
         let am = am.clone();
         let usage_cache = usage_cache.clone();
+        let codex_cache = codex_cache.clone();
         let mut sd = shutdown_rx.clone();
         rt_handle.spawn(async move {
             loop {
-                if *sd.borrow() { break; }
+                if *sd.borrow() {
+                    break;
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(TICK_INTERVAL_MS)) => {}
                     _ = sd.changed() => break,
                 }
                 let cache = usage_cache.lock().await.clone();
+                let codex = codex_cache.lock().await.clone();
                 let am = am.clone();
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                    let tray_source = current_tray_source(&am);
                     refresh_account_rows(&ui, &am, &cache);
+                    refresh_codex_rows(&ui, codex.as_ref(), &tray_source);
                 });
             }
         });
@@ -269,15 +314,15 @@ fn main() -> Result<()> {
             tracing::info!("compact-exit → compact-mode=false");
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_compact_mode(false);
-                let restore = FULL_WINDOW_SIZE
-                    .lock()
-                    .unwrap_or((380, 240));
+                let restore = FULL_WINDOW_SIZE.lock().unwrap_or((380, 240));
                 ui.window()
                     .set_size(slint::PhysicalSize::new(restore.0, restore.1));
             }
         });
     }
-    ui.on_open_claude_status(|| { let _ = open_url("https://status.claude.com"); });
+    ui.on_open_claude_status(|| {
+        let _ = open_url("https://status.claude.com");
+    });
     {
         let am = am.clone();
         let ui_weak = ui_weak.clone();
@@ -286,7 +331,10 @@ fn main() -> Result<()> {
             let _ = open_url("https://claude.ai/login");
             // Update status on UI.
             let _ = ui_weak.upgrade_in_event_loop(|ui| {
-                ui.set_status(StatusView { text: "ожидание куков…".into(), error: false });
+                ui.set_status(StatusView {
+                    text: "ожидание куков…".into(),
+                    error: false,
+                });
             });
         });
     }
@@ -300,7 +348,8 @@ fn main() -> Result<()> {
             rt_handle_inner.spawn(async move {
                 let current = proxy::load_proxy_url(&app_dir);
                 let prompt = "URL прокси (пусто — без прокси):";
-                let new = match show_input_dialog("Настройка прокси", prompt, &current).await {
+                let new = match show_input_dialog("Настройка прокси", prompt, &current).await
+                {
                     Some(s) => s,
                     None => return,
                 };
@@ -316,6 +365,9 @@ fn main() -> Result<()> {
         let am = am.clone();
         let ui_weak = ui_weak.clone();
         let usage_cache_ui = usage_cache.clone();
+        let codex_cache_ui = codex_cache.clone();
+        let tray_for_fetcher = tray_for_fetcher.clone();
+        let rt_handle_inner = rt_handle.clone();
         ui.on_row_activated(move |id: SharedString| {
             let id = id.to_string();
             tracing::info!(account = %id, "switch account requested");
@@ -323,11 +375,25 @@ fn main() -> Result<()> {
                 tracing::error!(error = %e, "switch_to failed");
             }
             claude_code_creds::sync_active_account(&am).ok();
-            let am = am.clone();
+            let am_for_ui = am.clone();
             let cache = usage_cache_ui.clone();
+            let codex_cache_for_ui = codex_cache_ui.clone();
             let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                 let snap = cache.try_lock().map(|g| g.clone()).unwrap_or_default();
-                refresh_account_rows(&ui, &am, &snap);
+                let codex = codex_cache_for_ui
+                    .try_lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let tray_source = current_tray_source(&am_for_ui);
+                refresh_account_rows(&ui, &am_for_ui, &snap);
+                refresh_codex_rows(&ui, codex.as_ref(), &tray_source);
+            });
+            let am = am.clone();
+            let usage_cache = usage_cache_ui.clone();
+            let codex_cache = codex_cache_ui.clone();
+            let tray = tray_for_fetcher.clone();
+            rt_handle_inner.spawn(async move {
+                update_tray_from_selected_source(&am, &usage_cache, &codex_cache, &tray).await;
             });
         });
     }
@@ -335,17 +401,104 @@ fn main() -> Result<()> {
         let am = am.clone();
         let ui_weak = ui_weak.clone();
         let usage_cache_ui = usage_cache.clone();
+        let codex_cache_ui = codex_cache.clone();
+        let tray_for_fetcher = tray_for_fetcher.clone();
+        let rt_handle_inner = rt_handle.clone();
         ui.on_row_remove(move |id: SharedString| {
             let id = id.to_string();
             tracing::info!(account = %id, "remove account requested");
             if let Err(e) = am.remove(&id) {
                 tracing::error!(error = %e, "remove failed");
             }
-            let am = am.clone();
+            let am_for_ui = am.clone();
             let cache = usage_cache_ui.clone();
+            let codex_cache_for_ui = codex_cache_ui.clone();
             let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                 let snap = cache.try_lock().map(|g| g.clone()).unwrap_or_default();
-                refresh_account_rows(&ui, &am, &snap);
+                let codex = codex_cache_for_ui
+                    .try_lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let tray_source = current_tray_source(&am_for_ui);
+                refresh_account_rows(&ui, &am_for_ui, &snap);
+                refresh_codex_rows(&ui, codex.as_ref(), &tray_source);
+            });
+            let am = am.clone();
+            let usage_cache = usage_cache_ui.clone();
+            let codex_cache = codex_cache_ui.clone();
+            let tray = tray_for_fetcher.clone();
+            rt_handle_inner.spawn(async move {
+                update_tray_from_selected_source(&am, &usage_cache, &codex_cache, &tray).await;
+            });
+        });
+    }
+    {
+        let am = am.clone();
+        let ui_weak = ui_weak.clone();
+        let usage_cache_ui = usage_cache.clone();
+        let codex_cache_ui = codex_cache.clone();
+        let tray_for_fetcher = tray_for_fetcher.clone();
+        let rt_handle_inner = rt_handle.clone();
+        ui.on_row_tray_clicked(move |id: SharedString| {
+            let id = id.to_string();
+            let source = claude_tray_source(&id);
+            tracing::info!(account = %id, "tray source switched to claude account");
+            if let Err(e) = am.set_tray_source(&source) {
+                tracing::error!(error = %e, "set_tray_source failed");
+            }
+            let am_for_ui = am.clone();
+            let cache = usage_cache_ui.clone();
+            let codex_cache_for_ui = codex_cache_ui.clone();
+            let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                let snap = cache.try_lock().map(|g| g.clone()).unwrap_or_default();
+                let codex = codex_cache_for_ui
+                    .try_lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let tray_source = current_tray_source(&am_for_ui);
+                refresh_account_rows(&ui, &am_for_ui, &snap);
+                refresh_codex_rows(&ui, codex.as_ref(), &tray_source);
+            });
+            let am = am.clone();
+            let usage_cache = usage_cache_ui.clone();
+            let codex_cache = codex_cache_ui.clone();
+            let tray = tray_for_fetcher.clone();
+            rt_handle_inner.spawn(async move {
+                update_tray_from_selected_source(&am, &usage_cache, &codex_cache, &tray).await;
+            });
+        });
+    }
+    {
+        let am = am.clone();
+        let ui_weak = ui_weak.clone();
+        let usage_cache_ui = usage_cache.clone();
+        let codex_cache_ui = codex_cache.clone();
+        let tray_for_fetcher = tray_for_fetcher.clone();
+        let rt_handle_inner = rt_handle.clone();
+        ui.on_codex_tray_clicked(move || {
+            tracing::info!("tray source switched to codex");
+            if let Err(e) = am.set_tray_source(CODEX_TRAY_SOURCE) {
+                tracing::error!(error = %e, "set_tray_source failed");
+            }
+            let am_for_ui = am.clone();
+            let cache = usage_cache_ui.clone();
+            let codex_cache_for_ui = codex_cache_ui.clone();
+            let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                let snap = cache.try_lock().map(|g| g.clone()).unwrap_or_default();
+                let codex = codex_cache_for_ui
+                    .try_lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let tray_source = current_tray_source(&am_for_ui);
+                refresh_account_rows(&ui, &am_for_ui, &snap);
+                refresh_codex_rows(&ui, codex.as_ref(), &tray_source);
+            });
+            let am = am.clone();
+            let usage_cache = usage_cache_ui.clone();
+            let codex_cache = codex_cache_ui.clone();
+            let tray = tray_for_fetcher.clone();
+            rt_handle_inner.spawn(async move {
+                update_tray_from_selected_source(&am, &usage_cache, &codex_cache, &tray).await;
             });
         });
     }
@@ -362,7 +515,9 @@ fn main() -> Result<()> {
         ui.on_refresh_clicked(move || {
             tracing::info!("refresh-clicked");
             let tx = tx.clone();
-            rt_handle_inner.spawn(async move { let _ = tx.send(RefreshKind::Active).await; });
+            rt_handle_inner.spawn(async move {
+                let _ = tx.send(RefreshKind::Active).await;
+            });
         });
     }
     {
@@ -371,7 +526,9 @@ fn main() -> Result<()> {
         ui.on_refresh_all_clicked(move || {
             tracing::info!("refresh-all-clicked");
             let tx = tx.clone();
-            rt_handle_inner.spawn(async move { let _ = tx.send(RefreshKind::All).await; });
+            rt_handle_inner.spawn(async move {
+                let _ = tx.send(RefreshKind::All).await;
+            });
         });
     }
     {
@@ -418,7 +575,9 @@ fn main() -> Result<()> {
     }
     {
         let tx = refresh_tx.clone();
-        rt_handle.spawn(async move { let _ = tx.send(RefreshKind::All).await; });
+        rt_handle.spawn(async move {
+            let _ = tx.send(RefreshKind::All).await;
+        });
     }
 
     // Hide from the Windows taskbar / Alt-Tab list. WS_EX_TOOLWINDOW must be
@@ -450,13 +609,39 @@ fn main() -> Result<()> {
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .try_init();
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RefreshKind { Active, All }
+enum RefreshKind {
+    Active,
+    All,
+}
+
+fn claude_tray_source(account_id: &str) -> String {
+    format!("{CLAUDE_TRAY_PREFIX}{account_id}")
+}
+
+fn current_tray_source(am: &AccountManager) -> String {
+    let accounts = am.all();
+    if let Some(saved) = am.tray_source().filter(|s| !s.is_empty()) {
+        if saved == CODEX_TRAY_SOURCE {
+            return saved;
+        }
+        if let Some(id) = saved.strip_prefix(CLAUDE_TRAY_PREFIX) {
+            if accounts.iter().any(|a| a.id == id) {
+                return saved;
+            }
+        }
+    }
+    am.active_id()
+        .map(|id| claude_tray_source(&id))
+        .unwrap_or_else(|| CODEX_TRAY_SOURCE.to_string())
+}
 
 // ─────────────────────────── UI helpers ──────────────────────────────────────
 
@@ -494,7 +679,9 @@ fn status_color(pct: f64) -> slint::Color {
 /// Replicates Python `_fmt_remaining`: "Хч Yм" / "Хм" / "Хд Yч".
 fn format_remaining(iso: Option<&str>) -> String {
     let Some(s) = iso else { return "".into() };
-    let Ok(when) = s.parse::<DateTime<Utc>>() else { return "".into() };
+    let Ok(when) = s.parse::<DateTime<Utc>>() else {
+        return "".into();
+    };
     let now = Utc::now();
     let secs = (when - now).num_seconds();
     if secs <= 0 {
@@ -503,7 +690,11 @@ fn format_remaining(iso: Option<&str>) -> String {
     if secs < 86_400 {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
-        return if h > 0 { format!("{h}ч {m}м") } else { format!("{m}м") };
+        return if h > 0 {
+            format!("{h}ч {m}м")
+        } else {
+            format!("{m}м")
+        };
     }
     let d = secs / 86_400;
     let h = (secs % 86_400) / 3600;
@@ -525,6 +716,7 @@ fn login_display(email: &str, name: &str) -> String {
 fn plan_color(plan: &str) -> slint::Color {
     match plan {
         "Pro" => slint::Color::from_rgb_u8(0xa7, 0x8b, 0xfa),
+        "Pro Lite" => slint::Color::from_rgb_u8(0xc4, 0xb5, 0xfd),
         "Max" | "Max100" => slint::Color::from_rgb_u8(0x60, 0xa5, 0xfa),
         "Max200" => slint::Color::from_rgb_u8(0x38, 0xbd, 0xf8),
         "Free" => slint::Color::from_rgb_u8(0x6b, 0x72, 0x80),
@@ -544,20 +736,34 @@ fn format_proxy_label(url: &str) -> String {
 fn push_initial_state(ui: &AppWindow, am: &AccountManager, app_dir: &std::path::Path) {
     let label = format_proxy_label(&proxy::load_proxy_url(app_dir));
     ui.set_proxy_label(label.into());
-    ui.set_status(StatusView { text: "загрузка…".into(), error: false });
+    ui.set_status(StatusView {
+        text: "загрузка…".into(),
+        error: false,
+    });
     refresh_account_rows(ui, am, &HashMap::new());
+    let tray_source = current_tray_source(am);
+    refresh_codex_rows(ui, None, &tray_source);
 }
 
 fn build_account_view(
     a: &claude_monitor::types::Account,
     is_active: bool,
+    is_tray_source: bool,
     cached: Option<&UsageResponse>,
 ) -> AccountView {
     let (five, seven, design) = match cached {
         Some(u) => (
-            u.five_hour.as_ref().map(build_metric).unwrap_or_else(empty_metric),
-            u.seven_day.as_ref().map(build_metric).unwrap_or_else(empty_metric),
-            u.seven_day_omelette.as_ref().map(build_metric).unwrap_or_else(empty_metric),
+            u.five_hour
+                .as_ref()
+                .map(build_metric)
+                .unwrap_or_else(empty_metric),
+            u.seven_day
+                .as_ref()
+                .map(build_metric)
+                .unwrap_or_else(empty_metric),
+            u.claude_design_metric()
+                .map(build_metric)
+                .unwrap_or_else(empty_metric),
         ),
         None => (empty_metric(), empty_metric(), empty_metric()),
     };
@@ -565,12 +771,80 @@ fn build_account_view(
         id: a.id.clone().into(),
         login: login_display(&a.email, &a.name).into(),
         login_full: a.email.clone().into(),
+        provider_kind: "claude".into(),
         plan: a.plan.clone().into(),
         plan_color: plan_color(&a.plan),
+        session: "".into(),
         five_hour: five,
         seven_day: seven,
         seven_day_design: design,
         is_active,
+        is_tray_source,
+    }
+}
+
+fn session_display(session: Option<&str>) -> String {
+    let Some(s) = session else {
+        return "—".into();
+    };
+    if s.is_empty() {
+        "—".into()
+    } else {
+        s.split('-').next().unwrap_or(s).to_string()
+    }
+}
+
+fn build_codex_view(
+    cached: Option<&codex_usage::CodexUsageSnapshot>,
+    is_tray_source: bool,
+) -> AccountView {
+    let email = cached.and_then(|u| u.email.as_deref()).unwrap_or("");
+    let plan = cached
+        .map(|u| u.plan.as_str())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("Codex");
+    AccountView {
+        id: "codex".into(),
+        login: login_display(email, "Codex").into(),
+        login_full: email.into(),
+        provider_kind: "chatgpt".into(),
+        plan: plan.into(),
+        plan_color: plan_color(plan),
+        session: session_display(cached.and_then(|u| u.session.as_deref())).into(),
+        five_hour: cached
+            .and_then(|u| u.five_hour.as_ref())
+            .map(build_metric)
+            .unwrap_or_else(empty_metric),
+        seven_day: cached
+            .and_then(|u| u.seven_day.as_ref())
+            .map(build_metric)
+            .unwrap_or_else(empty_metric),
+        seven_day_design: empty_metric(),
+        is_active: true,
+        is_tray_source,
+    }
+}
+
+fn refresh_codex_rows(
+    ui: &AppWindow,
+    cached: Option<&codex_usage::CodexUsageSnapshot>,
+    tray_source: &str,
+) {
+    let rows = vec![build_codex_view(cached, tray_source == CODEX_TRAY_SOURCE)];
+    let model_rc = ui.get_codex_accounts();
+    if let Some(vec_model) = model_rc.as_any().downcast_ref::<VecModel<AccountView>>() {
+        while vec_model.row_count() > rows.len() {
+            vec_model.remove(vec_model.row_count() - 1);
+        }
+        for (i, row) in rows.iter().enumerate() {
+            if i < vec_model.row_count() {
+                vec_model.set_row_data(i, row.clone());
+            } else {
+                vec_model.push(row.clone());
+            }
+        }
+    } else {
+        ui.set_codex_accounts(ModelRc::new(VecModel::from(rows)));
     }
 }
 
@@ -607,11 +881,20 @@ fn refresh_account_rows(
     usage: &HashMap<String, UsageResponse>,
 ) {
     let active_id = am.active_id().unwrap_or_default();
+    let tray_source = current_tray_source(am);
     let mut accounts = am.all();
     accounts.sort_by_key(|a| account_sort_key(usage.get(&a.id)));
     let rows: Vec<AccountView> = accounts
         .into_iter()
-        .map(|a| build_account_view(&a, a.id == active_id, usage.get(&a.id)))
+        .map(|a| {
+            let source = claude_tray_source(&a.id);
+            build_account_view(
+                &a,
+                a.id == active_id,
+                source == tray_source,
+                usage.get(&a.id),
+            )
+        })
         .collect();
 
     // In-place update of the existing VecModel — preserves Slint's per-row
@@ -658,6 +941,7 @@ fn refresh_account_rows(
         "id": r.id.as_str(),
         "login": r.login.as_str(),
         "is_active": r.is_active,
+        "is_tray_source": r.is_tray_source,
         "five_hour":  { "has": r.five_hour.has_data,         "pct": r.five_hour.pct_text.as_str(),         "reset": r.five_hour.reset_text.as_str() },
         "seven_day":  { "has": r.seven_day.has_data,         "pct": r.seven_day.pct_text.as_str(),         "reset": r.seven_day.reset_text.as_str() },
         "design":     { "has": r.seven_day_design.has_data,  "pct": r.seven_day_design.pct_text.as_str(),  "reset": r.seven_day_design.reset_text.as_str() },
@@ -699,7 +983,14 @@ async fn handle_cookie_events(
         let cookie_file = am.account_file(&aid);
         if let Ok(ctx) = http_client::load_account_session(&cookie_file) {
             if let Ok(id) = api::fetch_identity(&app_dir, &ctx).await {
-                am.update_info(&aid, Some(&id.email), Some(&id.display_name), Some(&id.plan), Some(&id.uuid)).ok();
+                am.update_info(
+                    &aid,
+                    Some(&id.email),
+                    Some(&id.display_name),
+                    Some(&id.plan),
+                    Some(&id.uuid),
+                )
+                .ok();
                 am.confirm(&aid).ok();
                 tracing::info!(account = %aid, email = %id.email, "identity resolved");
             }
@@ -729,9 +1020,13 @@ async fn handle_tray_commands(
                 });
             }
             TrayCommand::Hide => {
-                let _ = ui_weak.upgrade_in_event_loop(|ui| { let _ = ui.window().hide(); });
+                let _ = ui_weak.upgrade_in_event_loop(|ui| {
+                    let _ = ui.window().hide();
+                });
             }
-            TrayCommand::Refresh => { let _ = refresh_tx.send(RefreshKind::All).await; }
+            TrayCommand::Refresh => {
+                let _ = refresh_tx.send(RefreshKind::All).await;
+            }
             TrayCommand::Relogin => {
                 am.unblock_next_save(60);
                 let _ = open_url("https://claude.ai/login");
@@ -755,6 +1050,49 @@ struct SendableTray(Arc<tray_mod::TrayHandle>);
 unsafe impl Send for SendableTray {}
 unsafe impl Sync for SendableTray {}
 
+async fn update_tray_from_selected_source(
+    am: &AccountManager,
+    usage_cache: &UsageCache,
+    codex_cache: &CodexUsageCache,
+    tray: &Arc<parking_lot::Mutex<Option<SendableTray>>>,
+) {
+    let Some(handle) = tray.lock().clone() else {
+        return;
+    };
+    let source = current_tray_source(am);
+    if source == CODEX_TRAY_SOURCE {
+        let snapshot = codex_cache.lock().await.clone();
+        let five = snapshot.as_ref().and_then(|s| s.five_hour.as_ref());
+        let seven = snapshot.as_ref().and_then(|s| s.seven_day.as_ref());
+        update_tray_icons_from_metrics(&handle.0, five, seven);
+        return;
+    }
+    let Some(account_id) = source.strip_prefix(CLAUDE_TRAY_PREFIX) else {
+        update_tray_icons_from_metrics(&handle.0, None, None);
+        return;
+    };
+    let cache = usage_cache.lock().await;
+    let usage = cache.get(account_id);
+    update_tray_icons_from_metrics(
+        &handle.0,
+        usage.and_then(|u| u.five_hour.as_ref()),
+        usage.and_then(|u| u.seven_day.as_ref()),
+    );
+}
+
+fn update_tray_icons_from_metrics(
+    handle: &tray_mod::TrayHandle,
+    five_hour: Option<&MetricBucket>,
+    seven_day: Option<&MetricBucket>,
+) {
+    let session_pct = five_hour.map(|m| m.percent());
+    let weekly_pct = seven_day.map(|m| m.percent());
+    let session_reset = format_remaining(five_hour.and_then(|m| m.resets_at.as_deref()));
+    let weekly_reset = format_remaining(seven_day.and_then(|m| m.resets_at.as_deref()));
+    let _ = tray_mod::update_session(handle, session_pct, &session_reset);
+    let _ = tray_mod::update_weekly(handle, weekly_pct, &weekly_reset);
+}
+
 /// Drops `is-refreshing` back to `false` even if the surrounding future panics
 /// or is cancelled mid-fetch. Without this, a stuck network request would leave
 /// the spinner whirling forever and starve UI clicks.
@@ -765,7 +1103,9 @@ impl RefreshGuard {
     fn new(ui: Weak<AppWindow>) -> Self {
         let w = ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = w.upgrade() { ui.set_is_refreshing(true); }
+            if let Some(ui) = w.upgrade() {
+                ui.set_is_refreshing(true);
+            }
         });
         Self { ui }
     }
@@ -774,7 +1114,9 @@ impl Drop for RefreshGuard {
     fn drop(&mut self) {
         let w = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = w.upgrade() { ui.set_is_refreshing(false); }
+            if let Some(ui) = w.upgrade() {
+                ui.set_is_refreshing(false);
+            }
         });
     }
 }
@@ -786,6 +1128,7 @@ async fn periodic_fetcher(
     app_dir: PathBuf,
     ui_weak: Weak<AppWindow>,
     usage_cache: UsageCache,
+    codex_cache: CodexUsageCache,
     tray: Arc<parking_lot::Mutex<Option<SendableTray>>>,
     mut refresh_rx: mpsc::Receiver<RefreshKind>,
     shutdown: &mut watch::Receiver<bool>,
@@ -800,12 +1143,16 @@ async fn periodic_fetcher(
     let mut last_all_fetch: Option<Instant> = None;
 
     loop {
-        if *shutdown.borrow() { break; }
+        if *shutdown.borrow() {
+            break;
+        }
 
-        let active_due = last_active_fetch
-            .map_or(true, |t| t.elapsed() >= Duration::from_secs(FETCH_INTERVAL_SECS));
-        let all_due = last_all_fetch
-            .map_or(true, |t| t.elapsed() >= Duration::from_secs(PER_ACCOUNT_FETCH_INTERVAL_SECS));
+        let active_due = last_active_fetch.map_or(true, |t| {
+            t.elapsed() >= Duration::from_secs(FETCH_INTERVAL_SECS)
+        });
+        let all_due = last_all_fetch.map_or(true, |t| {
+            t.elapsed() >= Duration::from_secs(PER_ACCOUNT_FETCH_INTERVAL_SECS)
+        });
 
         let mut requested: Option<RefreshKind> = None;
         if !active_due && !all_due {
@@ -816,11 +1163,17 @@ async fn periodic_fetcher(
             }
         } else {
             // Drain any pending refresh request without blocking.
-            if let Ok(k) = refresh_rx.try_recv() { requested = Some(k); }
+            if let Ok(k) = refresh_rx.try_recv() {
+                requested = Some(k);
+            }
         }
 
-        let do_active = active_due || matches!(requested, Some(RefreshKind::Active) | Some(RefreshKind::All));
-        let do_all    = all_due    || matches!(requested, Some(RefreshKind::All));
+        let do_active = active_due
+            || matches!(
+                requested,
+                Some(RefreshKind::Active) | Some(RefreshKind::All)
+            );
+        let do_all = all_due || matches!(requested, Some(RefreshKind::All));
 
         let active_id = am.active_id().unwrap_or_default();
 
@@ -832,30 +1185,18 @@ async fn periodic_fetcher(
         if do_active && !active_id.is_empty() {
             last_active_fetch = Some(Instant::now());
             fetch_one(&am, &app_dir, &active_id, &usage_cache, &ui_weak).await;
-            // Update tray icons from active account's usage.
-            let tray_clone = tray.lock().clone();
-            if let Some(t) = tray_clone {
-                let cache = usage_cache.lock().await;
-                if let Some(u) = cache.get(&active_id) {
-                    let s = u.five_hour.as_ref().map(|m| m.percent());
-                    let w = u.seven_day.as_ref().map(|m| m.percent());
-                    let s_reset = format_remaining(
-                        u.five_hour.as_ref().and_then(|m| m.resets_at.as_deref()),
-                    );
-                    let w_reset = format_remaining(
-                        u.seven_day.as_ref().and_then(|m| m.resets_at.as_deref()),
-                    );
-                    let _ = tray_mod::update_session(&t.0, s, &s_reset);
-                    let _ = tray_mod::update_weekly(&t.0, w, &w_reset);
-                }
-            }
         }
         if do_all {
             last_all_fetch = Some(Instant::now());
             for acc in am.all() {
-                if acc.id == active_id { continue; } // already done above
+                if acc.id == active_id {
+                    continue;
+                } // already done above
                 fetch_one(&am, &app_dir, &acc.id, &usage_cache, &ui_weak).await;
             }
+        }
+        if do_active || do_all {
+            update_tray_from_selected_source(&am, &usage_cache, &codex_cache, &tray).await;
         }
 
         // _spin_guard drops here → spinner stops.
@@ -875,7 +1216,10 @@ async fn fetch_one(
         _ => {
             let aid_owned = aid.to_string();
             let _ = ui_weak.upgrade_in_event_loop(move |ui| {
-                ui.set_status(StatusView { text: format!("сессия {} отсутствует", aid_owned).into(), error: true });
+                ui.set_status(StatusView {
+                    text: format!("сессия {} отсутствует", aid_owned).into(),
+                    error: true,
+                });
             });
             return;
         }
@@ -887,7 +1231,10 @@ async fn fetch_one(
             tracing::warn!(account = %aid, "fetch_usage timed out");
             let aid_owned = aid.to_string();
             let _ = ui_weak.upgrade_in_event_loop(move |ui| {
-                ui.set_status(StatusView { text: format!("таймаут fetch ({})", aid_owned).into(), error: true });
+                ui.set_status(StatusView {
+                    text: format!("таймаут fetch ({})", aid_owned).into(),
+                    error: true,
+                });
             });
             return;
         }
@@ -903,14 +1250,20 @@ async fn fetch_one(
             let now_text = chrono::Local::now().format("%H:%M:%S").to_string();
             let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                 refresh_account_rows(&ui, &am, &cache);
-                ui.set_status(StatusView { text: format!("обновлено: {now_text}").into(), error: false });
+                ui.set_status(StatusView {
+                    text: format!("обновлено: {now_text}").into(),
+                    error: false,
+                });
             });
         }
         Err(e) => {
             tracing::warn!(account = %aid, error = %e, "fetch_usage failed");
             let aid_owned = aid.to_string();
             let _ = ui_weak.upgrade_in_event_loop(move |ui| {
-                ui.set_status(StatusView { text: format!("ошибка fetch ({}): {}", aid_owned, e).into(), error: true });
+                ui.set_status(StatusView {
+                    text: format!("ошибка fetch ({}): {}", aid_owned, e).into(),
+                    error: true,
+                });
             });
         }
     }
@@ -918,7 +1271,9 @@ async fn fetch_one(
 
 async fn periodic_incidents(shutdown: &mut watch::Receiver<bool>) {
     loop {
-        if *shutdown.borrow() { break; }
+        if *shutdown.borrow() {
+            break;
+        }
         match api::fetch_incidents().await {
             Ok(list) => tracing::debug!(count = list.len(), "incidents"),
             Err(e) => tracing::debug!(error = %e, "incidents fetch failed"),
@@ -930,15 +1285,95 @@ async fn periodic_incidents(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn periodic_codex_fetcher(
+    app_dir: PathBuf,
+    ui_weak: Weak<AppWindow>,
+    am: Arc<AccountManager>,
+    usage_cache: UsageCache,
+    codex_cache: CodexUsageCache,
+    tray: Arc<parking_lot::Mutex<Option<SendableTray>>>,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut last_fetch: Option<Instant> = None;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let due = last_fetch.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+        if due {
+            last_fetch = Some(Instant::now());
+            fetch_codex_once(&app_dir, &ui_weak, &am, &usage_cache, &codex_cache, &tray).await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
+async fn fetch_codex_once(
+    app_dir: &std::path::Path,
+    ui_weak: &Weak<AppWindow>,
+    am: &Arc<AccountManager>,
+    usage_cache: &UsageCache,
+    codex_cache: &CodexUsageCache,
+    tray: &Arc<parking_lot::Mutex<Option<SendableTray>>>,
+) {
+    match codex_usage::load_current() {
+        Ok(snapshot) => {
+            {
+                let mut g = codex_cache.lock().await;
+                *g = Some(snapshot.clone());
+            }
+            write_codex_diagnostic(app_dir, &snapshot);
+            let am_for_ui = am.clone();
+            let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                let tray_source = current_tray_source(&am_for_ui);
+                refresh_codex_rows(&ui, Some(&snapshot), &tray_source);
+            });
+            update_tray_from_selected_source(am, usage_cache, codex_cache, tray).await;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "codex usage fetch failed");
+        }
+    }
+}
+
+fn write_codex_diagnostic(app_dir: &std::path::Path, snapshot: &codex_usage::CodexUsageSnapshot) {
+    let body = serde_json::json!({
+        "email": snapshot.email.as_deref().unwrap_or(""),
+        "plan": snapshot.plan,
+        "session": snapshot.session.as_deref().unwrap_or(""),
+        "five_hour": {
+            "has": snapshot.five_hour.is_some(),
+            "pct": snapshot.five_hour.as_ref().map(|m| m.percent()),
+            "reset": snapshot.five_hour.as_ref().and_then(|m| m.resets_at.as_deref()),
+        },
+        "seven_day": {
+            "has": snapshot.seven_day.is_some(),
+            "pct": snapshot.seven_day.as_ref().map(|m| m.percent()),
+            "reset": snapshot.seven_day.as_ref().and_then(|m| m.resets_at.as_deref()),
+        }
+    });
+    if let Ok(s) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(app_dir.join("last_codex_usage.json"), s);
+    }
+}
+
 // ─────────────────────────── platform helpers ────────────────────────────────
 
 #[cfg(windows)]
 fn open_url(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn().map(|_| ())
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
 }
 
 #[cfg(not(windows))]
-fn open_url(_url: &str) -> std::io::Result<()> { Ok(()) }
+fn open_url(_url: &str) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Wire tray-icon's MenuEvent + TrayIconEvent receivers to UI actions.
 /// Each receiver runs in its own std::thread because both are global
@@ -993,7 +1428,12 @@ fn wire_tray_events(
             use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
             let rx = TrayIconEvent::receiver();
             while let Ok(ev) = rx.recv() {
-                if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = ev
+                {
                     tracing::info!("tray icon left-click → show window");
                     let ui_w = ui_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -1023,7 +1463,9 @@ fn window_top_left(ui: &AppWindow) -> Option<(i32, i32)> {
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
     let hwnd = slint_hwnd(ui)?;
     let mut r = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut r).ok()?; }
+    unsafe {
+        GetWindowRect(hwnd, &mut r).ok()?;
+    }
     Some((r.left, r.top))
 }
 
@@ -1033,7 +1475,9 @@ fn slint_hwnd(ui: &AppWindow) -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::Foundation::HWND;
     let win_handle = ui.window().window_handle();
     let raw = win_handle.window_handle().ok()?.as_raw();
-    let RawWindowHandle::Win32(w) = raw else { return None };
+    let RawWindowHandle::Win32(w) = raw else {
+        return None;
+    };
     Some(HWND(w.hwnd.get() as *mut _))
 }
 
@@ -1061,19 +1505,24 @@ fn restore_and_focus(ui: &AppWindow) {
 #[cfg(windows)]
 fn make_tool_window(ui: &AppWindow) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-        HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
     let Some(hwnd) = slint_hwnd(ui) else { return };
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
         let mut ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        ex |=  WS_EX_TOOLWINDOW.0 as isize;
+        ex |= WS_EX_TOOLWINDOW.0 as isize;
         ex &= !(WS_EX_APPWINDOW.0 as isize);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
         let _ = SetWindowPos(
-            hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1090,7 +1539,12 @@ fn start_window_drag(ui: &AppWindow) {
     let Some(hwnd) = slint_hwnd(ui) else { return };
     unsafe {
         let _ = ReleaseCapture();
-        SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+        SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDOWN,
+            WPARAM(HTCAPTION as usize),
+            LPARAM(0),
+        );
         // The Win32 modal drag loop swallows the mouse-up that ends the drag,
         // so Slint's TouchAreas remain stuck in "left-button pressed" state.
         // Symptom: every subsequent click on refresh / min / close / checkbox /

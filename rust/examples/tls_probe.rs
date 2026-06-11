@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use claude_monitor::types::{StorageState, last_active_org};
+use claude_monitor::types::{last_active_org, StorageState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -90,17 +90,19 @@ async fn main() -> Result<()> {
                     if ok {
                         ok_count += 1;
                     }
-                    eprintln!(
-                        "[probe] round {} GET {} → {}",
-                        round,
-                        path,
-                        r.status()
-                    );
+                    eprintln!("[probe] round {} GET {} → {}", round, path, r.status());
                     if ok && *path == "/api/organizations" && org_uuid_from_cookie.is_empty() {
                         if let Ok(orgs) = r.json::<Vec<serde_json::Value>>().await {
-                            if let Some(u) = orgs.first().and_then(|o| o.get("uuid")).and_then(|v| v.as_str()) {
+                            if let Some(u) = orgs
+                                .first()
+                                .and_then(|o| o.get("uuid"))
+                                .and_then(|v| v.as_str())
+                            {
                                 org_uuid_from_cookie = u.to_string();
-                                eprintln!("[probe] picked org_uuid from response: {}", org_uuid_from_cookie);
+                                eprintln!(
+                                    "[probe] picked org_uuid from response: {}",
+                                    org_uuid_from_cookie
+                                );
                             }
                         }
                     }

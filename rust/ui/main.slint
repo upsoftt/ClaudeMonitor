@@ -17,12 +17,15 @@ export struct AccountView {
     id: string,
     login: string,           // pre-truncated to 6 chars + "…"
     login-full: string,      // tooltip
+    provider-kind: string,
     plan: string,
     plan-color: color,
+    session: string,
     five-hour: MetricView,
     seven-day: MetricView,
     seven-day-design: MetricView,
     is-active: bool,
+    is-tray-source: bool,
 }
 
 export struct StatusView {
@@ -85,6 +88,7 @@ component AccountRow inherits Rectangle {
 
     callback row-right-clicked(length /* x */, length /* y */);
     callback chk-clicked();
+    callback tray-clicked();
     // Fires when user starts dragging on the row (anywhere except chk circle).
     // The row's full-area TouchArea below consumes left-clicks, so the outer
     // drag_root never sees them — we have to forward the drag intent here.
@@ -99,8 +103,8 @@ component AccountRow inherits Rectangle {
     // Coordinates relative to AccountRow: 4 (padding) + 22 (chk) + 4 (gap) = 30,
     // plus 80 width = 110.
     property <bool> show-name-tooltip: rmenu_touch.has-hover
-        && rmenu_touch.mouse-x >= 30px
-        && rmenu_touch.mouse-x < 110px
+        && rmenu_touch.mouse-x >= 44px
+        && rmenu_touch.mouse-x < 124px
         && account.login-full != "";
 
     rmenu_touch := TouchArea {
@@ -137,7 +141,19 @@ component AccountRow inherits Rectangle {
                 }
             }
         }
-        Rectangle { width: 4px; }
+        Rectangle {
+            width: 18px;
+            if account.provider-kind == "chatgpt" : Image {
+                x: 3px; y: (parent.height - 12px) / 2;
+                width: 12px; height: 12px;
+                source: @image-url("openai-chatgpt.svg");
+            }
+            if account.provider-kind != "chatgpt" : Image {
+                x: 3px; y: (parent.height - 12px) / 2;
+                width: 12px; height: 12px;
+                source: @image-url("claude-code.svg");
+            }
+        }
 
         // NAME: 80 wide, just clipped (no ellipsis). Tooltip with the full email
         // shows when the row's TouchArea reports a hover within this column's
@@ -224,12 +240,29 @@ component AccountRow inherits Rectangle {
                 font-size: 11px;
             }
         }
+        Rectangle { horizontal-stretch: 1; }
+        Rectangle {
+            width: 22px;
+            tray_touch := TouchArea {
+                width: 18px; height: 18px;
+                x: 2px;
+                y: (parent.height - 18px) / 2;
+                clicked => { root.tray-clicked(); }
+
+                CheckCircle {
+                    x: 1px; y: 1px;
+                    active: account.is-tray-source;
+                    hovered: tray_touch.has-hover;
+                }
+            }
+        }
+        Rectangle { width: 18px; }
     }
 
     // Hover tooltip for the truncated login name. Sits above the row so it
     // never overlaps the row's own content. Width follows the text.
     if show-name-tooltip : Rectangle {
-        x: 30px;
+        x: 44px;
         y: -22px;
         height: 20px;
         background: #1a1a1a;
@@ -247,6 +280,144 @@ component AccountRow inherits Rectangle {
             font-size: 11px;
             vertical-alignment: center;
         }
+    }
+}
+
+component CodexRow inherits Rectangle {
+    in property <AccountView> account;
+
+    callback tray-clicked();
+
+    height: 38px;
+    background: #101018;
+    border-radius: 4px;
+
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        spacing: 0px;
+
+        Rectangle {
+            width: 22px;
+            Text {
+                width: 100%; height: 100%;
+                text: "›";
+                color: #10b981;
+                font-size: 15px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            width: 18px;
+            if account.provider-kind == "chatgpt" : Image {
+                x: 3px; y: (parent.height - 12px) / 2;
+                width: 12px; height: 12px;
+                source: @image-url("openai-chatgpt.svg");
+            }
+            if account.provider-kind != "chatgpt" : Image {
+                x: 3px; y: (parent.height - 12px) / 2;
+                width: 12px; height: 12px;
+                source: @image-url("claude-code.svg");
+            }
+        }
+
+        Rectangle {
+            width: 80px;
+            clip: true;
+            Text {
+                width: 100%;
+                text: account.login;
+                color: #e8e8e8;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                overflow: clip;
+            }
+        }
+
+        Rectangle {
+            width: 42px;
+            Text {
+                width: 100%;
+                text: account.plan;
+                color: account.plan-color;
+                font-size: 11px;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                overflow: elide;
+            }
+        }
+
+        Rectangle {
+            width: 60px; height: 32px; background: transparent;
+            Text {
+                x: 0; y: 1px; width: 60px; height: 16px;
+                text: account.five-hour.has-data ? account.five-hour.pct-text : "…";
+                color: account.five-hour.has-data ? account.five-hour.color : #555555;
+                horizontal-alignment: left; vertical-alignment: center;
+                font-size: 13px; font-weight: 600;
+            }
+            Text {
+                x: 0; y: 17px; width: 60px; height: 14px;
+                text: account.five-hour.has-data ? account.five-hour.reset-text : "";
+                color: #888888; horizontal-alignment: left; vertical-alignment: center;
+                font-size: 11px;
+            }
+        }
+        Rectangle {
+            width: 60px; height: 32px; background: transparent;
+            Text {
+                x: 0; y: 1px; width: 60px; height: 16px;
+                text: account.seven-day.has-data ? account.seven-day.pct-text : "…";
+                color: account.seven-day.has-data ? account.seven-day.color : #555555;
+                horizontal-alignment: left; vertical-alignment: center;
+                font-size: 13px; font-weight: 600;
+            }
+            Text {
+                x: 0; y: 17px; width: 60px; height: 14px;
+                text: account.seven-day.has-data ? account.seven-day.reset-text : "";
+                color: #888888; horizontal-alignment: left; vertical-alignment: center;
+                font-size: 11px;
+            }
+        }
+        Rectangle {
+            width: 60px; height: 32px; background: transparent;
+            Text {
+                x: 0; y: 1px; width: 60px; height: 16px;
+                text: account.seven-day-design.has-data ? account.seven-day-design.pct-text : "…";
+                color: account.seven-day-design.has-data ? account.seven-day-design.color : #555555;
+                horizontal-alignment: left; vertical-alignment: center;
+                font-size: 13px; font-weight: 600;
+            }
+            Text {
+                x: 0; y: 17px; width: 60px; height: 14px;
+                text: account.seven-day-design.has-data ? account.seven-day-design.reset-text : "";
+                color: #888888; horizontal-alignment: left; vertical-alignment: center;
+                font-size: 11px;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Rectangle {
+            width: 22px;
+            tray_touch := TouchArea {
+                width: 18px; height: 18px;
+                x: 2px;
+                y: (parent.height - 18px) / 2;
+                clicked => { root.tray-clicked(); }
+
+                CheckCircle {
+                    x: 1px; y: 1px;
+                    active: account.is-tray-source;
+                    hovered: tray_touch.has-hover;
+                }
+            }
+        }
+        Rectangle { width: 18px; }
     }
 }
 
@@ -362,11 +533,12 @@ export component AppWindow inherits Window {
     // controls how big Slint thinks its drawing surface is — without it,
     // Slint keeps laying content out at 380×fullHeight and the right side
     // gets clipped after Rust shrinks the OS window.
-    width: compact-mode ? 160px : 380px;
+    width: compact-mode ? 160px : 430px;
     preferred-height: compact-mode ? 36px : content_root.preferred-height + 10px;
 
     // ── data ───────────────────────────────────────────────
     in property <[AccountView]> accounts: [];
+    in property <[AccountView]> codex-accounts: [];
     in property <StatusView> status: { text: "", error: false };
     in property <bool> auto-switch-enabled: false;
     in property <bool> is-refreshing: false;
@@ -387,6 +559,8 @@ export component AppWindow inherits Window {
     callback row-activated(string /* id */);
     callback row-context(string /* id */, length /* x */, length /* y */);
     callback row-remove(string /* id */);
+    callback row-tray-clicked(string /* id */);
+    callback codex-tray-clicked();
     callback toggle-auto-switch();
     callback relogin-clicked();
     callback configure-proxy-clicked();
@@ -530,23 +704,16 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // ── Top separator above "Аккаунты" ──────────
+            // ── Top separator above "Клод" ──────────
             Rectangle {
                 height: 1px;
                 background: #2a2a2a;
             }
 
-            // ── Section header: "Аккаунты" + "+ Добавить" ─
+            // ── Section header: "Клод" + "+ Добавить" ─
             HorizontalLayout {
                 spacing: 4px;
-                Text {
-                    text: "АККАУНТЫ";
-                    color: #888888;
-                    font-size: 9px;
-                    letter-spacing: 1px;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
+                Rectangle { horizontal-stretch: 1; }
                 add_touch := TouchArea {
                     width: 76px; height: 18px;
                     
@@ -572,12 +739,15 @@ export component AppWindow inherits Window {
                 padding-left: 4px; padding-right: 4px;
                 spacing: 0px;
                 Rectangle { width: 22px; }
-                Rectangle { width: 4px; }
+                Rectangle { width: 18px; }
                 Rectangle { width: 80px; Text { width: 100%; text: "Логин";    color: #888888; font-size: 10px; horizontal-alignment: left; } }
                 Rectangle { width: 42px; Text { width: 100%; text: "Тариф";    color: #888888; font-size: 10px; horizontal-alignment: left; } }
                 Rectangle { width: 60px; Text { width: 100%; text: "5ч сессия"; color: #888888; font-size: 10px; horizontal-alignment: left; } }
                 Rectangle { width: 60px; Text { width: 100%; text: "7д лимит";  color: #888888; font-size: 10px; horizontal-alignment: left; } }
                 Rectangle { width: 60px; Text { width: 100%; text: "7д Design"; color: #888888; font-size: 10px; horizontal-alignment: left; } }
+                Rectangle { horizontal-stretch: 1; }
+                Rectangle { width: 22px; }
+                Rectangle { width: 18px; }
             }
 
             // ── Account rows ───────────────────────────
@@ -586,6 +756,7 @@ export component AppWindow inherits Window {
                 for acc in accounts : AccountRow {
                     account: acc;
                     chk-clicked => { root.row-activated(acc.id); }
+                    tray-clicked => { root.row-tray-clicked(acc.id); }
                     row-drag-start => { root.drag-start(); }
                     row-right-clicked(rx, ry) => {
                         root.row-menu-aid = acc.id;
@@ -595,6 +766,14 @@ export component AppWindow inherits Window {
                         root.row-menu-open = true;
                         root.window-menu-open = false;
                     }
+                }
+            }
+
+            VerticalLayout {
+                spacing: 1px;
+                for acc in codex-accounts : CodexRow {
+                    account: acc;
+                    tray-clicked => { root.codex-tray-clicked(); }
                 }
             }
 

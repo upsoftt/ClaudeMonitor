@@ -50,7 +50,9 @@ pub fn load_proxy_url(app_dir: &Path) -> String {
 
 /// Persist proxy URL (empty clears it). Invalidates the in-memory decision cache.
 pub fn save_proxy_url(app_dir: &Path, url: &str) -> anyhow::Result<()> {
-    let cfg = ProxyConfig { url: url.trim().to_string() };
+    let cfg = ProxyConfig {
+        url: url.trim().to_string(),
+    };
     let body = serde_json::to_string_pretty(&cfg)?;
     crate::account_manager::atomic_write(&crate::paths::proxy_file(app_dir), body.as_bytes())?;
     invalidate_cache();
@@ -77,7 +79,11 @@ pub async fn probe_direct_ok() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    match client.get("https://claude.ai/api/organizations").send().await {
+    match client
+        .get("https://claude.ai/api/organizations")
+        .send()
+        .await
+    {
         Ok(r) => {
             let s = r.status().as_u16();
             s != 451 && s < 500

@@ -17,4 +17,4 @@ REM when redirected from this cmd.exe parent.
 REM Use the fully-qualified path (%~dp0 = this script's dir): under TrayConsole's
 REM restart environment cmd does not search the current directory for a bare
 REM `ClaudeMonitor.exe`, so it failed with "is not recognized as a command".
-"%~dp0ClaudeMonitor.exe" 2>> logs\rust.stderr.log
+start "" /wait "%~dp0ClaudeMonitor.exe" 2>> logs\rust.stderr.log

@@ -34,8 +34,7 @@ pub fn read() -> Result<Option<CcTokens>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let file: CredentialsFile = serde_json::from_str(&raw).unwrap_or_default();
     Ok(file.claude_ai_oauth)
 }
@@ -162,7 +161,8 @@ mod tests {
         let mut file = CredentialsFile::default();
         file.claude_ai_oauth = Some(tok.clone());
         // Some Claude Code installs may have unrelated keys we must preserve.
-        file.extras.insert("misc".into(), serde_json::json!({"foo": "bar"}));
+        file.extras
+            .insert("misc".into(), serde_json::json!({"foo": "bar"}));
         let s = serde_json::to_string(&file).unwrap();
         let parsed: CredentialsFile = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.claude_ai_oauth.as_ref().unwrap().expires_at, 12345);

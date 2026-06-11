@@ -1,6 +1,30 @@
 # ClaudeMonitor - Архитектура
 
 ## Общая архитектура
+Актуальная production-версия — Rust desktop-приложение в `rust/` с UI на Slint. Запуск выполняется через `start.bat`, который копирует `rust/target/release/ClaudeMonitor.exe` в корень и стартует его под TrayConsole. Legacy-файл `usage_monitor.py` остаётся в репозитории как историческая Python/PyQt5 реализация.
+
+## Актуальные компоненты Rust-версии
+
+### 1. Claude usage
+- `rust/src/account_manager.rs` хранит Claude-аккаунты и storage_state cookie-файлы.
+- `rust/src/api.rs` вызывает claude.ai API для identity, usage, ping и Statuspage.
+- `rust/src/main.rs` держит кеш `UsageResponse` по аккаунтам, обновляет строки UI и tray-иконки.
+- Источник двух tray-иконок выбирается отдельно от активного Claude-аккаунта: `accounts_meta.json.tray_source` хранит `claude:<account_id>` или `codex`.
+
+### 2. Codex usage
+- `rust/src/codex_usage.rs` читает локальную Codex-сессию из `~/.codex`.
+- Лимиты берутся из последнего события `codex.rate_limits` в `logs_2.sqlite`: `primary` = 5ч, `secondary` = 7д.
+- Логин и тариф берутся из JWT в `~/.codex/auth.json`.
+- `rust/src/main.rs` обновляет Codex-строку раз в минуту и пересчитывает reset-таймеры каждую секунду.
+- Если выбран источник `codex`, Codex-обновление сразу перерисовывает обе tray-иконки из 5ч/7д метрик Codex.
+
+### 3. UI
+- `rust/ui/main.slint` содержит два раздела: "КЛОД" для Claude-аккаунтов и "КОДЕКС" для локальной Codex-сессии.
+- Правая галочка в каждой строке показывает и меняет источник tray-иконок; левая галочка Claude-строк по-прежнему переключает активный Claude-аккаунт.
+
+## Legacy Python architecture
+Ниже сохранено описание старой Python/PyQt5 версии для исторического контекста.
+
 Однофайловое PyQt5-приложение (`usage_monitor.py`) с многопоточной моделью. GUI в главном потоке, фоновые операции (логин, fetch, ping, инциденты) в QThread.
 
 ## Компоненты фичи мониторинга инцидентов

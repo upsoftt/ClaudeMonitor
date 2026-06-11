@@ -90,10 +90,7 @@ pub fn apply_default_headers(rb: reqwest::RequestBuilder, cookie: &str) -> reqwe
 /// Run `op` with direct connection first; on transport error retry through the
 /// configured proxy. Auth errors (401/403/451) are NOT retried — proxies don't
 /// fix bad cookies.
-pub async fn with_proxy_fallback<T, F, Fut>(
-    app_dir: &std::path::Path,
-    op: F,
-) -> Result<T>
+pub async fn with_proxy_fallback<T, F, Fut>(app_dir: &std::path::Path, op: F) -> Result<T>
 where
     F: Fn(reqwest::Client) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -108,7 +105,11 @@ where
     // probing first, a blocked direct path costs 5s once, then every request
     // goes straight through the proxy (~0.5s), comfortably inside the 15s budget.
     let chosen = crate::proxy::effective_proxy_url(app_dir).await;
-    let proxy_opt = if chosen.is_empty() { None } else { Some(chosen.as_str()) };
+    let proxy_opt = if chosen.is_empty() {
+        None
+    } else {
+        Some(chosen.as_str())
+    };
 
     let err: anyhow::Error = match op(make_client(proxy_opt)?).await {
         Ok(v) => return Ok(v),
@@ -165,9 +166,24 @@ mod tests {
     #[test]
     fn cookie_header_filters_to_claude_ai() {
         let cookies = vec![
-            Cookie { name: "sessionKey".into(), value: "sk".into(), domain: ".claude.ai".into(), ..Default::default() },
-            Cookie { name: "evil".into(), value: "x".into(), domain: ".attacker.test".into(), ..Default::default() },
-            Cookie { name: "lastActiveOrg".into(), value: "org".into(), domain: "claude.ai".into(), ..Default::default() },
+            Cookie {
+                name: "sessionKey".into(),
+                value: "sk".into(),
+                domain: ".claude.ai".into(),
+                ..Default::default()
+            },
+            Cookie {
+                name: "evil".into(),
+                value: "x".into(),
+                domain: ".attacker.test".into(),
+                ..Default::default()
+            },
+            Cookie {
+                name: "lastActiveOrg".into(),
+                value: "org".into(),
+                domain: "claude.ai".into(),
+                ..Default::default()
+            },
         ];
         let h = cookie_header(&cookies);
         assert!(h.contains("sessionKey=sk"));

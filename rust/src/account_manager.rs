@@ -39,10 +39,8 @@ pub fn atomic_write(target: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
-    let s = std::fs::read_to_string(p)
-        .with_context(|| format!("read {}", p.display()))?;
-    Ok(serde_json::from_str(&s)
-        .with_context(|| format!("parse {}", p.display()))?)
+    let s = std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
+    Ok(serde_json::from_str(&s).with_context(|| format!("parse {}", p.display()))?)
 }
 
 fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
@@ -111,6 +109,20 @@ impl AccountManager {
 
     pub fn active_id(&self) -> Option<String> {
         self.load_meta().active
+    }
+
+    pub fn tray_source(&self) -> Option<String> {
+        self.load_meta().tray_source
+    }
+
+    pub fn set_tray_source(&self, source: &str) -> Result<()> {
+        let mut meta = self.load_meta();
+        meta.tray_source = if source.trim().is_empty() {
+            None
+        } else {
+            Some(source.to_string())
+        };
+        self.save_meta(&meta)
     }
 
     /// Path to the active account's storage file, or the legacy single-account file.
@@ -204,7 +216,12 @@ impl AccountManager {
     pub fn save_cookies(&self, cookies: Vec<Cookie>) -> Result<SaveResult> {
         let session_key = match crate::types::session_key(&cookies) {
             Some(s) => s.to_string(),
-            None => return Ok(SaveResult { account_id: None, outcome: SaveOutcome::Rejected }),
+            None => {
+                return Ok(SaveResult {
+                    account_id: None,
+                    outcome: SaveOutcome::Rejected,
+                })
+            }
         };
         let last_active_org = crate::types::last_active_org(&cookies)
             .map(String::from)
@@ -214,11 +231,17 @@ impl AccountManager {
         if !last_active_org.is_empty() && !bypass {
             let meta = self.load_meta();
             if meta.removed_orgs.iter().any(|o| o == &last_active_org) {
-                return Ok(SaveResult { account_id: None, outcome: SaveOutcome::Rejected });
+                return Ok(SaveResult {
+                    account_id: None,
+                    outcome: SaveOutcome::Rejected,
+                });
             }
         }
 
-        let storage = StorageState { cookies: cookies.clone(), origins: vec![] };
+        let storage = StorageState {
+            cookies: cookies.clone(),
+            origins: vec![],
+        };
         let storage_bytes = serde_json::to_vec_pretty(&storage)?;
 
         // Fast local dedup by stable cookies (no network).
@@ -244,7 +267,11 @@ impl AccountManager {
 
         let mut meta = self.load_meta();
         let exists = meta.accounts.iter().any(|a| a.id == aid);
-        let outcome = if exists { SaveOutcome::Refreshed } else { SaveOutcome::Created };
+        let outcome = if exists {
+            SaveOutcome::Refreshed
+        } else {
+            SaveOutcome::Created
+        };
 
         atomic_write(&self.account_file(&aid), &storage_bytes)?;
 
@@ -275,7 +302,10 @@ impl AccountManager {
         }
         self.save_meta(&meta)?;
 
-        Ok(SaveResult { account_id: Some(aid), outcome })
+        Ok(SaveResult {
+            account_id: Some(aid),
+            outcome,
+        })
     }
 
     pub fn switch_to(&self, account_id: &str) -> Result<()> {
@@ -295,10 +325,26 @@ impl AccountManager {
         let mut meta = self.load_meta();
         for acc in &mut meta.accounts {
             if acc.id == account_id {
-                if let Some(e) = email { if !e.is_empty() { acc.email = e.into(); } }
-                if let Some(n) = name { if !n.is_empty() { acc.name = n.into(); } }
-                if let Some(p) = plan { if !p.is_empty() { acc.plan = p.into(); } }
-                if let Some(u) = uuid { if !u.is_empty() { acc.uuid = u.into(); } }
+                if let Some(e) = email {
+                    if !e.is_empty() {
+                        acc.email = e.into();
+                    }
+                }
+                if let Some(n) = name {
+                    if !n.is_empty() {
+                        acc.name = n.into();
+                    }
+                }
+                if let Some(p) = plan {
+                    if !p.is_empty() {
+                        acc.plan = p.into();
+                    }
+                }
+                if let Some(u) = uuid {
+                    if !u.is_empty() {
+                        acc.uuid = u.into();
+                    }
+                }
                 break;
             }
         }
@@ -351,6 +397,10 @@ impl AccountManager {
         if meta.active.as_deref() == Some(account_id) {
             meta.active = meta.accounts.first().map(|a| a.id.clone());
         }
+        let removed_tray_source = format!("claude:{account_id}");
+        if meta.tray_source.as_deref() == Some(removed_tray_source.as_str()) {
+            meta.tray_source = meta.active.as_ref().map(|id| format!("claude:{id}"));
+        }
         if !org.is_empty() && !meta.removed_orgs.iter().any(|o| o == &org) {
             meta.removed_orgs.push(org);
         }
@@ -369,10 +419,9 @@ impl AccountManager {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
-        let cookies: Vec<Cookie> = serde_json::from_value(
-            v.get("cookies").cloned().unwrap_or(Value::Array(vec![])),
-        )
-        .unwrap_or_default();
+        let cookies: Vec<Cookie> =
+            serde_json::from_value(v.get("cookies").cloned().unwrap_or(Value::Array(vec![])))
+                .unwrap_or_default();
         if cookies.is_empty() {
             return Ok(());
         }
@@ -401,7 +450,10 @@ mod tests {
     fn save_cookies_creates_account_with_session_key() {
         let tmp = TempDir::new().unwrap();
         let am = AccountManager::new(tmp.path()).unwrap();
-        let cookies = vec![cookie("sessionKey", "sk-abc"), cookie("lastActiveOrg", "org-1")];
+        let cookies = vec![
+            cookie("sessionKey", "sk-abc"),
+            cookie("lastActiveOrg", "org-1"),
+        ];
         let r = am.save_cookies(cookies).unwrap();
         assert_eq!(r.outcome, SaveOutcome::Created);
         let aid = r.account_id.unwrap();
@@ -423,7 +475,10 @@ mod tests {
         };
         am.save_meta(&meta).unwrap();
         let r = am
-            .save_cookies(vec![cookie("sessionKey", "x"), cookie("lastActiveOrg", "org-bad")])
+            .save_cookies(vec![
+                cookie("sessionKey", "x"),
+                cookie("lastActiveOrg", "org-bad"),
+            ])
             .unwrap();
         assert_eq!(r.outcome, SaveOutcome::Rejected);
         assert!(r.account_id.is_none());
@@ -441,7 +496,10 @@ mod tests {
         .unwrap();
         am.unblock_next_save(60);
         let r = am
-            .save_cookies(vec![cookie("sessionKey", "x"), cookie("lastActiveOrg", "org-bad")])
+            .save_cookies(vec![
+                cookie("sessionKey", "x"),
+                cookie("lastActiveOrg", "org-bad"),
+            ])
             .unwrap();
         assert_eq!(r.outcome, SaveOutcome::Created);
         // Bypass consumed → org dropped from blacklist.
@@ -457,7 +515,10 @@ mod tests {
         let am = AccountManager::new(tmp.path()).unwrap();
         // Initial save → creates acc and sets pending.
         let r1 = am
-            .save_cookies(vec![cookie("sessionKey", "sk1"), cookie("lastActiveOrg", "org-A")])
+            .save_cookies(vec![
+                cookie("sessionKey", "sk1"),
+                cookie("lastActiveOrg", "org-A"),
+            ])
             .unwrap();
         let aid = r1.account_id.unwrap();
         // Confirm with email so find_by_stable_cookies will consider it.
@@ -465,10 +526,76 @@ mod tests {
         am.confirm(&aid).unwrap();
         // Different sessionKey but same lastActiveOrg → match by org.
         let r2 = am
-            .save_cookies(vec![cookie("sessionKey", "sk2-new"), cookie("lastActiveOrg", "org-A")])
+            .save_cookies(vec![
+                cookie("sessionKey", "sk2-new"),
+                cookie("lastActiveOrg", "org-A"),
+            ])
             .unwrap();
         assert_eq!(r2.outcome, SaveOutcome::Refreshed);
         assert_eq!(r2.account_id.as_deref(), Some(aid.as_str()));
+    }
+
+    #[test]
+    fn tray_source_round_trips_separately_from_active_account() {
+        let tmp = TempDir::new().unwrap();
+        let am = AccountManager::new(tmp.path()).unwrap();
+        let id1 = am
+            .save_cookies(vec![
+                cookie("sessionKey", "sk-a"),
+                cookie("lastActiveOrg", "org-a"),
+            ])
+            .unwrap()
+            .account_id
+            .unwrap();
+        let id2 = am
+            .save_cookies(vec![
+                cookie("sessionKey", "sk-b"),
+                cookie("lastActiveOrg", "org-b"),
+            ])
+            .unwrap()
+            .account_id
+            .unwrap();
+
+        am.switch_to(&id1).unwrap();
+        am.set_tray_source(&format!("claude:{id2}")).unwrap();
+
+        assert_eq!(am.active_id().as_deref(), Some(id1.as_str()));
+        assert_eq!(
+            am.tray_source().as_deref(),
+            Some(format!("claude:{id2}").as_str())
+        );
+    }
+
+    #[test]
+    fn removing_selected_tray_source_falls_back_to_active_account() {
+        let tmp = TempDir::new().unwrap();
+        let am = AccountManager::new(tmp.path()).unwrap();
+        let id1 = am
+            .save_cookies(vec![
+                cookie("sessionKey", "sk-a"),
+                cookie("lastActiveOrg", "org-a"),
+            ])
+            .unwrap()
+            .account_id
+            .unwrap();
+        let id2 = am
+            .save_cookies(vec![
+                cookie("sessionKey", "sk-b"),
+                cookie("lastActiveOrg", "org-b"),
+            ])
+            .unwrap()
+            .account_id
+            .unwrap();
+
+        am.switch_to(&id1).unwrap();
+        am.set_tray_source(&format!("claude:{id2}")).unwrap();
+        am.remove(&id2).unwrap();
+
+        assert_eq!(am.active_id().as_deref(), Some(id1.as_str()));
+        assert_eq!(
+            am.tray_source().as_deref(),
+            Some(format!("claude:{id1}").as_str())
+        );
     }
 
     #[test]
@@ -476,10 +603,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let am = AccountManager::new(tmp.path()).unwrap();
         let r1 = am
-            .save_cookies(vec![cookie("sessionKey", "s1"), cookie("lastActiveOrg", "org-1")])
+            .save_cookies(vec![
+                cookie("sessionKey", "s1"),
+                cookie("lastActiveOrg", "org-1"),
+            ])
             .unwrap();
         let r2 = am
-            .save_cookies(vec![cookie("sessionKey", "s2"), cookie("lastActiveOrg", "org-2")])
+            .save_cookies(vec![
+                cookie("sessionKey", "s2"),
+                cookie("lastActiveOrg", "org-2"),
+            ])
             .unwrap();
         let id1 = r1.account_id.unwrap();
         let id2 = r2.account_id.unwrap();
@@ -503,7 +636,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let am = AccountManager::new(tmp.path()).unwrap();
         let r = am
-            .save_cookies(vec![cookie("sessionKey", "s"), cookie("lastActiveOrg", "o")])
+            .save_cookies(vec![
+                cookie("sessionKey", "s"),
+                cookie("lastActiveOrg", "o"),
+            ])
             .unwrap();
         let aid = r.account_id.unwrap();
         let tok = CcTokens {
